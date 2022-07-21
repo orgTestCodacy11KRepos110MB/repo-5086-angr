@@ -32,7 +32,6 @@ _all_optimization_passes = [
     (RetAddrSaveSimplifier, True),
     (X86GccGetPcSimplifier, True),
     (LoweredSwitchSimplifier, False),
-    (EagerReturnsSimplifier, True),
     (ITEExprConverter, True),
     (ExprOpSwapper, True),
     (CallArgSimplifier, True),
