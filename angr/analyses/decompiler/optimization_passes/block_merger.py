@@ -19,7 +19,25 @@ from ... import AnalysesHub
 from ....utils.graph import dominates
 
 
-_l = logging.getLogger(name=__name__)
+l = logging.getLogger(name=__name__)
+l.setLevel(1)
+
+#
+# Exceptions
+#
+
+
+class SAILRException(Exception):
+    pass
+
+
+class BadMergeTargetException(SAILRException):
+    pass
+
+
+class MaxMergeAttempts(SAILRException):
+    pass
+
 
 
 #
@@ -585,14 +603,14 @@ def remove_redundant_jumps(graph: nx.DiGraph):
             if isinstance(last_stmt, Jump) and len(target_blk.statements) > 1:
                 continue
 
-            # must have successors otherwise we could be remove a final jump out of the function
+            # must have successors otherwise we could be removing a final jump out of the function
             target_successors = list(graph.successors(target_blk))
             if not target_successors:
                 continue
 
             if isinstance(last_stmt, ConditionalJump):
                 if len(target_successors) > 2:
-                    print("WARNING: incorrect amount of successors found for node in redundant_jumps")
+                    continue
 
                 if len(target_successors) == 2:
                     # skip real ConditionalJumps (ones with two different true/false target)
@@ -605,10 +623,10 @@ def remove_redundant_jumps(graph: nx.DiGraph):
                         continue
                     
                     # remove the outdated successor edge
-                    outdated_blk = [blk for blk in target_blk if blk.addr != last_stmt.true_target.value][0]
+                    outdated_blk = [blk for blk in target_successors if blk.addr != last_stmt.true_target.value][0]
 
                     graph.remove_edge(target_blk, outdated_blk)
-                    print(f"REMOVING EDGE IN SIMPLE_REDUNDANT: {(target_blk, outdated_blk)}")
+                    l.info(f"Removing simple redundant jump/cond: {(target_blk, outdated_blk)}")
                     # restart the search because we fixed edges
                     change |= True
                     break
@@ -718,9 +736,14 @@ def generate_merge_targets(blocks, graph: nx.DiGraph) -> Tuple[nx.DiGraph, Dict[
             }
 
             merge_graph = clone_graph_with_splits(removable_graph.copy(), base_og_to_merge)
-            merge_start = [node for node in merge_graph.nodes if merge_graph.in_degree(node) == 0][0]
+
+            # sanity checks we are not merging in a loop merge target
+            try:
+                merge_start = [node for node in merge_graph.nodes if merge_graph.in_degree(node) == 0][0]
+            except IndexError:
+                raise BadMergeTargetException("Unable to merge a merge-graph with no head node")
+
             merge_ends = [node for node in merge_graph.nodes if merge_graph.out_degree(node) == 0]
-            #breakpoint()
             merge_blocks, og_blocks = bfs_list_blocks(merge_start, merge_graph), bfs_list_blocks(merge_base, removable_graph)
 
             base_to_merge_end = {
@@ -803,21 +826,33 @@ class BlockMerger(OptimizationPass):
     #
 
     def _analyze(self, cache=None):
+        #self.out_graph = self.simple_optimize_graph(self._graph)
+        #return
         """
         Entry analysis routine that will trigger the other analysis stages
         """
+        try:
+            self.merge_duplicate_graphs()
+        except MaxMergeAttempts as e:
+            raise e
+        except SAILRException as e:
+            l.warning(f"Encountered a exception of type {e.__class__.__name__} that stopped analysis on the function"
+                      f" early with reason: {e.args[0] if len(e.args) > 0 else None}")
+
+    def merge_duplicate_graphs(self):
         max_iters = 10
         curr_iter = 0
 
-        self.exclusion_blocks = set()
+        # always optimize graph
         self.write_graph = self.simple_optimize_graph(self._graph)
-        #self.out_graph = self.write_graph
+        self.exclusion_blocks = set()
 
         while True:
             curr_iter += 1
-            print(f"=========================== RUNNING ANALYSIS ROUND {curr_iter} ===========================")
             if curr_iter >= max_iters:
-                raise Exception("Exceeded max iterations allowed for duplication fixing")
+                raise MaxMergeAttempts(f"Max analysis iterations of {max_iters} hit on function: {self._func}")
+
+            l.info(f"Running analysis round: {curr_iter}")
 
             # do all writes on write_graph and all reads on read_graph
             self.read_graph = self.write_graph.copy()
@@ -828,18 +863,19 @@ class BlockMerger(OptimizationPass):
 
             candidates = self._find_initial_candidates()
             if not candidates:
-                print("There are no duplicate statements in this function")
+                l.info("There are no duplicate statements in this function, stopping analysis")
                 break
 
             candidates = self._filter_candidates(candidates)
             if not candidates:
-                print("There are no duplicate blocks in this function")
+                l.info("There are no duplicate blocks in this function, stopping analysis")
                 break
 
             candidates = sorted(candidates, key=lambda x: len(x))
-            print(f"CANDIDATES FOUND: {candidates}")
+            l.info(f"Located {len(candidates)} candidates for merging: {candidates}")
+
             candidate = candidates.pop()
-            print(f"CANDIDATE SELECTED: {candidate}")
+            l.info(f"Selecting the candidate: {candidate}")
 
             #
             # 1: locate the longest duplicate sequence in a graph and split it at the merge
@@ -857,7 +893,7 @@ class BlockMerger(OptimizationPass):
             # 2: destroy the old blocks that will be merged and add the new merge graph
             #
 
-            print(f"DESTROYING NODES: {removable_nodes}")
+            l.info(f"Destroying nodes: {removable_nodes}")
             self.write_graph.remove_nodes_from(removable_nodes)
             self.write_graph = nx.compose(self.write_graph, merge_graph)
 
@@ -937,7 +973,7 @@ class BlockMerger(OptimizationPass):
                             {block.addr: new_block.addr}
                         )
 
-                        if (isinstance(last_stmt, ConditionalJump) and new_block.addr in (last_stmt.true_target.value, last_stmt.false_target.value))\
+                        if (isinstance(last_stmt, ConditionalJump) and new_block.addr in (last_stmt.true_target.value, last_stmt.false_target.value)) \
                                 or (isinstance(last_stmt, Jump) and new_block.addr == last_stmt.target.value):
                             self.write_graph.add_edge(cond, new_block)
             #
@@ -1105,15 +1141,12 @@ class BlockMerger(OptimizationPass):
             self.ri.function, cond_proc=self.ri.cond_proc, graph=self.write_graph
         )
 
-    
     def _share_subregion(self, blocks: List[Block]) -> bool:
         for region in self.ri.regions_by_block_addrs:
             if all(block.addr in region for block in blocks):
-                break
+                return True
         else:
             return False
-
-        return True
 
     def _find_initial_candidates(self) -> List[Tuple[Block, Block]]:
         initial_candidates = list()
