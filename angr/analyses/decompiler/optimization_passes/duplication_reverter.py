@@ -800,15 +800,15 @@ def generate_merge_targets(blocks, graph: nx.DiGraph) -> Tuple[nx.DiGraph, Dict[
 # Main Analysis
 #
 
-class BlockMerger(OptimizationPass):
+class DuplicationOptReverter(OptimizationPass):
     """
-    Merges blocks
+    Reverts the duplication of statements
     """
 
     ARCHES = ["X86", "AMD64", "ARMCortexM", "ARMHF", "ARMEL", ]
     PLATFORMS = ["cgc", "linux"]
     STAGE = OptimizationPassStage.DURING_REGION_IDENTIFICATION
-    NAME = "Block Merger"
+    NAME = "Revert Statement Duplication Opt"
     DESCRIPTION = __doc__.strip()
 
     def __init__(self, func, region_identifier=None, reaching_definitions=None, **kwargs):
@@ -1402,4 +1402,4 @@ class BlockMerger(OptimizationPass):
         return new_graph
 
 
-AnalysesHub.register_default("BlockMerger", BlockMerger)
+AnalysesHub.register_default("BlockMerger", DuplicationOptReverter)
