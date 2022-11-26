@@ -725,8 +725,7 @@ class DuplicationOptReverter(OptimizationPass):
         try:
             self.deduplication_analysis(max_fix_attempts=10)
         except Exception as e:
-            l.warning(f"Encountered an error while de-duplicating: {e.args[0]}")
-            raise e
+            l.critical(f"Encountered an error while de-duplicating: {e.args[0]}")
 
     def deduplication_analysis(self, max_fix_attempts=10):
         fix_round = 0
