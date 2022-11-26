@@ -764,8 +764,7 @@ class DuplicationOptReverter(OptimizationPass):
             func=self._func,
             structurer_cls=PhoenixStructurer
         )
-        # XXX: may need variable_kb=clinic.variable_kb
-        self.project.analyses.RegionSimplifier(self._func, rs.result, kb=self.kb)
+        self.project.analyses.RegionSimplifier(self._func, rs.result, kb=self.kb, variable_kb=self._variable_kb)
 
         # collect gotos
         self.goto_locations = {goto.addr for goto in self.kb.gotos.locations[self._func.addr]}
@@ -1561,7 +1560,6 @@ class DuplicationOptReverter(OptimizationPass):
                     if not lcs:
                         continue
 
-                    print(f"MERGING {can0} into {can1}")
                     merged_candidates.append(tuple(set(can0 + can1)))
                     queued.add(can0)
                     queued.add(can1)
@@ -1577,7 +1575,6 @@ class DuplicationOptReverter(OptimizationPass):
                     remaining_candidates.append(can)
 
             candidates = merged_candidates + remaining_candidates
-            print(f"filtered now: {candidates}")
 
         candidates = list(set(candidates))
         candidates = [
