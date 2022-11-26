@@ -1,5 +1,6 @@
 from collections import defaultdict
-from typing import List, Tuple, Optional, Dict, Set, Union
+from copy import deepcopy
+from typing import List, Tuple, Optional, Dict, Set, Union, Iterator
 import logging
 from itertools import combinations
 import itertools
@@ -10,34 +11,20 @@ import networkx as nx
 from ailment.block import Block
 from ailment.statement import Statement, ConditionalJump, Jump, Assignment
 from ailment.expression import Const, Register
+import claripy
 
 from .optimization_pass import OptimizationPass, OptimizationPassStage
 from ..region_identifier import RegionIdentifier, GraphRegion, MultiNode
+from ..structuring import RecursiveStructurer, PhoenixStructurer
 from ....analyses.reaching_definitions.reaching_definitions import ReachingDefinitionsAnalysis
 from ..utils import to_ail_supergraph
 from ... import AnalysesHub
 from ....utils.graph import dominates
+from ....knowledge_plugins.gotos import Goto
 
 
 l = logging.getLogger(name=__name__)
 l.setLevel(1)
-
-#
-# Exceptions
-#
-
-
-class SAILRException(Exception):
-    pass
-
-
-class BadMergeTargetException(SAILRException):
-    pass
-
-
-class MaxMergeAttempts(SAILRException):
-    pass
-
 
 
 #
@@ -672,7 +659,8 @@ class MergeTarget:
                  pre_block_map: Dict[Block, Block],
                  post_block_map: Dict[Block, Block],
                  successor_map: Dict[Block, List[Block]],
-                 original_graph: nx.DiGraph
+                 original_ends_map: Dict[Block, Block],
+                 original_graph: nx.DiGraph,
                  ):
         # [start_block, predecessor]
         self.predecessor_map = predecessor_map
@@ -682,7 +670,14 @@ class MergeTarget:
         self.post_block_map = post_block_map
         # [end_block, successor]
         self.successor_map = successor_map
+        # [original_end, merge_end]
+        self.original_ends_map = original_ends_map
+
+        # nx.Graph of nodes in the graph that can be deleted
         self.original_graph = original_graph
+
+        # [end_block, condition_call_stmt]
+        self.post_block_conditions = {}
 
     def __str__(self):
         return f"<MergeTarget: {{\npreds[{self.predecessor_map}],\npre_blocks[{self.pre_block_map}],\n" \
@@ -690,110 +685,6 @@ class MergeTarget:
 
     def __repr__(self):
         return str(self)
-
-
-def generate_merge_targets(blocks, graph: nx.DiGraph) -> Tuple[nx.DiGraph, Dict[Block, MergeTarget]]:
-    """
-    We locate the merge target graph as well as the places they differ.
-    Consider merge graphs:
-    Gx:    [A, B, C] -> [D,E] -> [F]
-    Gy:    [C] -> [D,E] -> [F, E]
-
-    Each merge graph has pre-blocks and post-blocks that will be split off
-    Gx-Pre-Blocks: [[A,B]]
-    Gy-Pre-Blocks: [None]
-    Gx-Post-Blocks: [None]
-    Gy-Post-Blocks: [[E]]
-
-    Plan:
-    1. Do two graphs at a time and try to find the longest common block seq
-
-    @param blocks:
-    @param graph:
-    @return:
-    """
-    merge_targets: Dict[Block, MergeTarget] = {}
-    graph_lcs = longest_ail_graph_subseq(blocks, graph)
-
-    # collect original graphs with their starts and ends
-    merge_base = blocks[0]
-    merge_graph = None
-
-    for block in blocks:
-        orig_blocks, split_blocks = ail_similarity_to_orig_blocks(block, graph_lcs, graph)
-        removable_graph: nx.DiGraph = nx.subgraph(graph, orig_blocks)
-
-        og_to_split = {}
-        for og_block, split_info in split_blocks.items():
-            lcs, idx = split_info
-            og_to_split[og_block] = split_ail_block(og_block, idx, len(lcs))
-
-        # create a merge_graph on first iteration (will always execute once)
-        if block is merge_base and not merge_graph:
-            base_og_to_merge = {
-                og: split[1]
-                for og, split in og_to_split.items() if split[1] is not None
-            }
-
-            merge_graph = clone_graph_with_splits(removable_graph.copy(), base_og_to_merge)
-
-            # sanity checks we are not merging in a loop merge target
-            try:
-                merge_start = [node for node in merge_graph.nodes if merge_graph.in_degree(node) == 0][0]
-            except IndexError:
-                raise BadMergeTargetException("Unable to merge a merge-graph with no head node")
-
-            merge_ends = [node for node in merge_graph.nodes if merge_graph.out_degree(node) == 0]
-            merge_blocks, og_blocks = bfs_list_blocks(merge_start, merge_graph), bfs_list_blocks(merge_base, removable_graph)
-
-            base_to_merge_end = {
-                og: merge_end for og, merge_end in zip(og_blocks, merge_blocks)
-                if merge_end in merge_ends
-            }
-
-        # create merge start association
-        pred_map = {
-            (split[0] if split[0] else block): list(graph.predecessors(block))
-            for _, split in og_to_split.items()
-        }
-        if not pred_map:
-            pred_map = {block: list(graph.predecessors(block))}
-
-        pre_block_map = {
-            (split[0] if split[0] else block): block
-            for _, split in og_to_split.items()
-        }
-        if not pre_block_map:
-            pre_block_map = {block: block}
-
-        # create merge end association
-        merge_end_to_og = {}
-        block_pairs = ail_graph_similarity(block, merge_base, graph, only_blocks=True) \
-            if block is not merge_base else [(og, og) for og, _ in base_to_merge_end.items()]
-        for target_b, base_b in block_pairs:
-            try:
-                merge_end = base_to_merge_end[base_b]
-            except KeyError:
-                continue
-
-            merge_end_to_og[merge_end] = target_b
-
-        post_block_map = {
-            merge_end: og_to_split[og][2] for merge_end, og in merge_end_to_og.items()
-            if og in og_to_split and og_to_split[og][2]
-        }
-        succ_map = {
-            merge_end: list(graph.successors(og)) for merge_end, og in merge_end_to_og.items()
-        }
-        merge_targets[block] = MergeTarget(
-            pred_map,
-            pre_block_map,
-            post_block_map,
-            succ_map,
-            removable_graph
-        )
-
-    return merge_graph, merge_targets
 
 
 #
@@ -814,6 +705,8 @@ class DuplicationOptReverter(OptimizationPass):
     def __init__(self, func, region_identifier=None, reaching_definitions=None, **kwargs):
         self.ri: RegionIdentifier = region_identifier
         self.rd: ReachingDefinitionsAnalysis = reaching_definitions
+        self.cond_proc = self.ri.cond_proc
+        self.goto_locations = None
         super().__init__(func, **kwargs)
 
         self.analyze()
@@ -826,221 +719,579 @@ class DuplicationOptReverter(OptimizationPass):
     #
 
     def _analyze(self, cache=None):
-        #self.out_graph = self.simple_optimize_graph(self._graph)
-        #return
         """
         Entry analysis routine that will trigger the other analysis stages
         """
         try:
-            self.merge_duplicate_graphs()
-        except MaxMergeAttempts as e:
+            self.deduplication_analysis(max_fix_attempts=10)
+        except Exception as e:
+            l.warning(f"Encountered an error while de-duplicating: {e.args[0]}")
             raise e
-        except SAILRException as e:
-            l.warning(f"Encountered a exception of type {e.__class__.__name__} that stopped analysis on the function"
-                      f" early with reason: {e.args[0] if len(e.args) > 0 else None}")
 
-    def merge_duplicate_graphs(self):
-        max_iters = 10
-        curr_iter = 0
+    def deduplication_analysis(self, max_fix_attempts=10):
+        fix_round = 0
+        self.write_graph = self._graph
+        self.candidate_blacklist = set()
 
-        # always optimize graph
-        self.write_graph = self.simple_optimize_graph(self._graph)
-        self.exclusion_blocks = set()
+        while fix_round <= max_fix_attempts:
+            self._pre_deduplication_round()
+            l.info(f"Running analysis round: {fix_round}")
+            fake_duplication, updates = self._deduplication_round()
+            if fake_duplication:
+                continue
 
-        while True:
-            curr_iter += 1
-            if curr_iter >= max_iters:
-                raise MaxMergeAttempts(f"Max analysis iterations of {max_iters} hit on function: {self._func}")
+            if not updates:
+                return
 
-            l.info(f"Running analysis round: {curr_iter}")
+            l.info(f"Writing to outgraph now")
+            self._post_deduplication_round()
+            fix_round += 1
 
-            # do all writes on write_graph and all reads on read_graph
-            self.read_graph = self.write_graph.copy()
-
-            #
-            # 0: Find candidates with duplicated AIL statements
-            #
-
-            candidates = self._find_initial_candidates()
-            if not candidates:
-                l.info("There are no duplicate statements in this function, stopping analysis")
+            # XXX: remmove
+            if fix_round == 2:
                 break
+        else:
+            raise Exception(f"Max fix attempts of {max_fix_attempts} done on function {self._func.name}")
 
-            candidates = self._filter_candidates(candidates)
-            if not candidates:
-                l.info("There are no duplicate blocks in this function, stopping analysis")
-                break
+    def _pre_deduplication_round(self):
+        # reset gotos
+        self.kb.gotos.locations[self._func.addr] = set()
 
-            candidates = sorted(candidates, key=lambda x: len(x))
-            l.info(f"Located {len(candidates)} candidates for merging: {candidates}")
+        # do structuring
+        rs = self.project.analyses[RecursiveStructurer].prep(kb=self.kb)(
+            deepcopy(self.ri.region),
+            cond_proc=self.ri.cond_proc,
+            func=self._func,
+            structurer_cls=PhoenixStructurer
+        )
+        # XXX: may need variable_kb=clinic.variable_kb
+        self.project.analyses.RegionSimplifier(self._func, rs.result, kb=self.kb)
 
-            candidate = candidates.pop()
-            l.info(f"Selecting the candidate: {candidate}")
+        # collect gotos
+        self.goto_locations = {goto.addr for goto in self.kb.gotos.locations[self._func.addr]}
 
-            #
-            # 1: locate the longest duplicate sequence in a graph and split it at the merge
-            #
+        # optimize the graph?
+        self.write_graph = self.simple_optimize_graph(self.write_graph)
+        self.read_graph = self.write_graph.copy()
 
-            merge_graph, merge_targets = generate_merge_targets(candidate, self.read_graph)
-            # any node in each target's original graph is removable
-            removable_nodes = set(itertools.chain.from_iterable(
-                [list(mt.original_graph.nodes) for _, mt in merge_targets.items()]
-            ))
-            merge_start = [node for node in merge_graph.nodes if merge_graph.in_degree(node) == 0][0]
-            merge_ends = [node for node in merge_graph.nodes if merge_graph.out_degree(node) == 0]
+    def _deduplication_round(self, max_fixes=10):
+        #
+        # 0: Find candidates with duplicated AIL statements
+        #
 
-            #
-            # 2: destroy the old blocks that will be merged and add the new merge graph
-            #
+        candidates = self._find_initial_candidates()
+        if not candidates:
+            l.info("There are no duplicate statements in this function, stopping analysis")
+            return False, False
 
-            l.info(f"Destroying nodes: {removable_nodes}")
-            self.write_graph.remove_nodes_from(removable_nodes)
-            self.write_graph = nx.compose(self.write_graph, merge_graph)
+        # with merge_candidates=False, max size for a candidate is 2
+        candidates = self._filter_candidates(candidates, merge_candidates=False)
+        if not candidates:
+            l.info("There are no duplicate blocks in this function, stopping analysis")
+            return False, False
 
-            #
-            # 3: clone the conditional graph
-            #
+        candidates = sorted(candidates, key=lambda x: len(x))
+        l.info(f"Located {len(candidates)} candidates for merging: {candidates}")
 
-            merge_end_to_cond_graph = {}
-            common_node_addr = shared_common_conditional_dom(candidate, self.read_graph).statements[-1].tags['ins_addr']
-            # guarantees at least a single run
-            for i, merge_end in enumerate(merge_ends):
+        candidate = candidates.pop()
+        l.info(f"Selecting the candidate: {candidate}")
 
-                # merge ends with no post blocks need no graph
-                if all(merge_end not in trgt.post_block_map for _, trgt in merge_targets.items()):
+        #
+        # 1: locate the longest duplicate sequence in a graph and split it at the merge
+        #
+
+        merge_graph, merge_targets = self.generate_merge_targets(candidate, self.read_graph)
+        if merge_graph is None or merge_targets is None:
+            l.info(f"Chosen candidate {candidate} was not connected with a goto")
+            self.candidate_blacklist.add(candidate)
+            return True, False
+
+        # any node in each target's original graph is removable
+        removable_nodes = set(itertools.chain.from_iterable(
+            [list(mt.original_graph.nodes) for _, mt in merge_targets.items()]
+        ))
+        merge_start = [node for node in merge_graph.nodes if merge_graph.in_degree(node) == 0][0]
+        merge_ends = [node for node in merge_graph.nodes if merge_graph.out_degree(node) == 0]
+
+        #
+        # 2: destroy the old blocks that will be merged and add the new merge graph
+        #
+
+        l.info(f"Destroying nodes: {removable_nodes}")
+        self.write_graph.remove_nodes_from(removable_nodes)
+        self.write_graph = nx.compose(self.write_graph, merge_graph)
+
+        #
+        # 3: clone the conditional graph
+        #
+
+        """
+        merge_end_to_cond_graph = {}
+        common_node_addr = shared_common_conditional_dom(candidate, self.read_graph).statements[-1].tags['ins_addr']
+        # guarantees at least a single run
+        for i, merge_end in enumerate(merge_ends):
+
+            # merge ends with no post blocks need no graph
+            if all(merge_end not in trgt.post_block_map for _, trgt in merge_targets.items()):
+                continue
+
+            cond_graph, pre_graph_map = self.copy_cond_graph(candidate, self.read_graph, idx=i + 1*curr_iter)
+            try:
+                root_cond = [node for node in cond_graph.nodes if cond_graph.in_degree(node) == 0][0]
+            except IndexError:
+                print("This duplication is in a looping condition, using a node estimate")
+                root_cond = find_block_by_addr(cond_graph, common_node_addr)
+
+            merge_end_to_cond_graph[merge_end] = (root_cond, cond_graph)
+        """
+
+        #
+        # 4: replace the edges from the preds to the pre block
+        #
+
+        for _, merge_target in merge_targets.items():
+            for pre_blk, old_blk in merge_target.pre_block_map.items():
+                new_block = pre_blk if pre_blk != old_blk else merge_start
+                for pred in merge_target.predecessor_map[pre_blk]:
+                    last_statement = pred.statements[-1]
+                    pred.statements[-1] = correct_jump_targets(
+                        last_statement,
+                        {old_blk.addr: new_block.addr},
+                    )
+
+                    self.write_graph.add_edge(pred, new_block)
+
+                # XXX: this can be dangerous when fixing loops since we can stop a loop from being recreated
+                if new_block == pre_blk and pre_blk != merge_start:
+                    self.write_graph.add_edge(pre_blk, merge_start)
+        #
+        # 5: make the merge graph ends point to conditional graph copies
+        #
+
+        """
+        for merge_end, cond_graph_info in merge_end_to_cond_graph.items():
+            cond_root, cond_graph = cond_graph_info
+            self.block_blacklist.update({blk for blk in cond_graph.nodes})
+            self.write_graph = nx.compose(self.write_graph, cond_graph)
+            self.write_graph.add_edge(merge_end, cond_root)
+        """
+        # XXX: this code assumes the candidate is only 2 graphs max, n graphs do not work.
+
+        #
+        # A: make merged conditions
+        #
+
+        merged_conditions = {}
+        for merge_end in merge_ends:
+            for _, merge_target in merge_targets.items():
+                post_block = merge_target.post_block_map.get(merge_end, None)
+                if post_block is None:
                     continue
 
-                cond_graph, pre_graph_map = self.copy_cond_graph(candidate, self.read_graph, idx=i + 1*curr_iter)
-                try:
-                    root_cond = [node for node in cond_graph.nodes if cond_graph.in_degree(node) == 0][0]
-                except IndexError:
-                    print("This duplication is in a looping condition, using a node estimate")
-                    root_cond = find_block_by_addr(cond_graph, common_node_addr)
-
-                merge_end_to_cond_graph[merge_end] = (root_cond, cond_graph)
-
-            #
-            # 4: replace the edges from the preds to the pre block
-            #
-
-            for _, merge_target in merge_targets.items():
-                for pre_blk, old_blk in merge_target.pre_block_map.items():
-                    new_block = pre_blk if pre_blk != old_blk else merge_start
-                    for pred in merge_target.predecessor_map[pre_blk]:
-                        last_statement = pred.statements[-1]
-                        pred.statements[-1] = correct_jump_targets(
-                            last_statement,
-                            {old_blk.addr: new_block.addr},
-                        )
-
-                        self.write_graph.add_edge(pred, new_block)
-
-                    # XXX: this can be dangerous when fixing loops since we can stop a loop from being recreated
-                    if new_block == pre_blk and pre_blk != merge_start:
-                        self.write_graph.add_edge(pre_blk, merge_start)
-            #
-            # 5: make the merge graph ends point to conditional graph copies
-            #
-
-            for merge_end, cond_graph_info in merge_end_to_cond_graph.items():
-                cond_root, cond_graph = cond_graph_info
-                self.exclusion_blocks.update({blk for blk in cond_graph.nodes})
-                self.write_graph = nx.compose(self.write_graph, cond_graph)
-                self.write_graph.add_edge(merge_end, cond_root)
-
-            #
-            # 6: make the new conditionals point to the post-block
-            #
-
-            for merge_end, cond_graph_info in merge_end_to_cond_graph.items():
-                cond_root, cond_graph = cond_graph_info
-
-                for block, merge_target in merge_targets.items():
-                    try:
-                        new_block = merge_target.post_block_map[merge_end]
-                    except KeyError:
-                        new_block = merge_target.successor_map[merge_end][0] \
-                            if len(merge_target.successor_map[merge_end]) > 0 else None
-
-                    # skip conditionals that actually have no continuation
-                    if not new_block:
-                        continue
-
-                    for cond in cond_graph.nodes:
-                        last_stmt = cond.statements[-1]
-                        cond.statements[-1] = correct_jump_targets(
-                            last_stmt,
-                            {block.addr: new_block.addr}
-                        )
-
-                        if (isinstance(last_stmt, ConditionalJump) and new_block.addr in (last_stmt.true_target.value, last_stmt.false_target.value)) \
-                                or (isinstance(last_stmt, Jump) and new_block.addr == last_stmt.target.value):
-                            self.write_graph.add_edge(cond, new_block)
-            #
-            # 7: make the post blocks continue to the next successors
-            #
-
-            for _, merge_target in merge_targets.items():
-                for merge_end, post_block in merge_target.post_block_map.items():
-                    if not post_block:
-                        continue
-
-                    for suc in merge_target.successor_map[merge_end]:
-                        self.write_graph.add_edge(post_block, suc)
-            #
-            # 8: AD-HOC-FIX nodes that could've been modified (fixed point)
-            #
-
-            while True:
-                new_nodes = []
-                for node in merge_graph.nodes:
-                    new_nodes += list(self.write_graph.predecessors(node))
-                    new_nodes += list(self.write_graph.successors(node))
-                    new_nodes += [node]
-                modified_nodes = set(new_nodes)
-
-                for node in modified_nodes:
-                    last_stmt = node.statements[-1]
-
-                    updated = False
-                    # only attempt to fix nodes that end in a jump
-                    if isinstance(last_stmt, ConditionalJump):
-                        targets = [last_stmt.true_target.value, last_stmt.false_target.value]
-                    elif isinstance(last_stmt, Jump):
-                        targets = [last_stmt.target.value]
-                    else:
-                        continue
-
-                    # check if the jump targets of each node are present in all successors of node
-                    all_succ = [suc.addr for suc in self.write_graph.successors(node)]
-                    for value in targets:
-                        if value in all_succ:
-                            continue
-
-                        # if not, find that block, re-add it
-                        try:
-                            new_succ = find_block_by_addr(self.write_graph, value)
-                        except Exception:
-                            continue
-
-                        self.write_graph.add_edge(node, new_succ)
-                        updated = True
-                        break
-
-                    if updated:
-                        break
-
+                if merge_end in merged_conditions:
+                    continue
                 else:
+                    merged_conditions[merge_end] = (
+                        merge_target.post_block_conditions[merge_end],
+                        merge_target
+                    )
+
+        #
+        # B: point them to the right places
+        #
+
+        post_cond_graphs: Dict[Block, nx.DiGraph] = defaultdict(nx.DiGraph)
+        for merge_end, condition_tup in merged_conditions.items():
+            condition, true_merge_target = condition_tup
+
+            # rip off an old blocks information
+            old_stmt_tags = merge_end.statements[0].tags
+            old_stmt_tags['ins_addr'] += 1
+            cond_block = Block(merge_end.addr+1, 1, idx=1)
+
+            # create a new condition
+            cond_jump = ConditionalJump(
+                1,
+                condition.copy() if condition is not None else None,
+                Const(None, None, 0, self.project.arch.bits),
+                Const(None, None, 0, self.project.arch.bits),
+                **old_stmt_tags
+            )
+            cond_block.statements = [cond_jump]
+
+            for merge_target in merge_targets.values():
+                try:
+                    new_block = merge_target.post_block_map[merge_end]
+                except KeyError:
+                    new_block = merge_target.successor_map[merge_end][0] \
+                        if len(merge_target.successor_map[merge_end]) > 0 else None
+
+                # skip conditionals that actually have no continuation
+                if not new_block:
+                    continue
+
+                if merge_target is true_merge_target:
+                    cond_jump.true_target.value = new_block.addr
+                else:
+                    cond_jump.false_target.value = new_block.addr
+
+                self.write_graph.add_edge(cond_block, new_block)
+                post_cond_graphs[merge_end].add_edge(cond_block, new_block)
+
+            self.write_graph.add_edge(merge_end, cond_block)
+            post_cond_graphs[merge_end].add_edge(merge_end, cond_block)
+
+        #
+        # 6: make the new conditionals point to the post-block
+        #
+
+        """
+        for merge_end, cond_graph_info in merge_end_to_cond_graph.items():
+            cond_root, cond_graph = cond_graph_info
+
+            for block, merge_target in merge_targets.items():
+                try:
+                    new_block = merge_target.post_block_map[merge_end]
+                except KeyError:
+                    new_block = merge_target.successor_map[merge_end][0] \
+                        if len(merge_target.successor_map[merge_end]) > 0 else None
+
+                # skip conditionals that actually have no continuation
+                if not new_block:
+                    continue
+
+                for cond in cond_graph.nodes:
+                    last_stmt = cond.statements[-1]
+                    cond.statements[-1] = correct_jump_targets(
+                        last_stmt,
+                        {block.addr: new_block.addr}
+                    )
+
+                    if (isinstance(last_stmt, ConditionalJump) and new_block.addr in (last_stmt.true_target.value, last_stmt.false_target.value)) \
+                            or (isinstance(last_stmt, Jump) and new_block.addr == last_stmt.target.value):
+                        self.write_graph.add_edge(cond, new_block)
+        """
+
+        #
+        # 7: make the post blocks continue to the next successors
+        #
+
+        post_is_condition = {}
+        for _, merge_target in merge_targets.items():
+            for merge_end, post_block in merge_target.post_block_map.items():
+                if not post_block:
+                    continue
+
+                # check is any post block is a condition
+                last_stmt = post_block.statements[-1]
+                if isinstance(last_stmt, ConditionalJump) and len(post_block.statements) == 1:
+                    post_is_condition[merge_target] = (merge_end, post_block)
+
+                for suc in merge_target.successor_map[merge_end]:
+                    self.write_graph.add_edge(post_block, suc)
+
+
+        #
+        # XXX: C (from part A and B above) extra fix pass for post blocks that are also conditional blocks
+        #
+
+        # TODO: this does not always work, go see true_localcharset why
+        if post_is_condition:
+            for merge_target, block_tup in post_is_condition.items():
+                merge_end, post_block = block_tup
+                nodes_between = set()
+                for suc in self.write_graph.successors(post_block):
+                    paths_between = nx.all_simple_paths(self.write_graph, source=merge_end, target=suc)
+                    nodes_between = {node for path in paths_between for node in path}
+
+                post_cond_graph = nx.subgraph(self.write_graph, nodes_between)
+                try:
+                    self.cond_proc.recover_reaching_conditions(None, graph=post_cond_graph)
+                except Exception:
+                    continue
+
+                # rip off an old blocks information
+                cond_block = post_block.copy()
+
+                # delete the old guarding condition, and the conditional post-block
+                self.write_graph.remove_nodes_from(list(post_cond_graph.predecessors(post_block)))
+
+                for suc in post_cond_graph.successors(post_block):
+                    guard_condition = self.cond_proc.guarding_conditions.get(suc, None)
+                    if not guard_condition:
+                        continue
+
+                    cond_block.statements[-1].condition = self.cond_proc.convert_claripy_bool_ast(guard_condition)
                     break
 
-            self.write_graph = self.simple_optimize_graph(self.write_graph)
-            self._update_subregions(
-                set(node.addr for node in removable_nodes),
-                set(node.addr for node in merge_graph.nodes)
+                self.write_graph.add_edge(merge_end, cond_block)
+
+
+        #
+        # 8: AD-HOC-FIX nodes that could've been modified (fixed point)
+        #
+
+        while True:
+            new_nodes = []
+            for node in merge_graph.nodes:
+                new_nodes += list(self.write_graph.predecessors(node))
+                new_nodes += list(self.write_graph.successors(node))
+                new_nodes += [node]
+            modified_nodes = set(new_nodes)
+
+            for node in modified_nodes:
+                last_stmt = node.statements[-1]
+
+                updated = False
+                # only attempt to fix nodes that end in a jump
+                if isinstance(last_stmt, ConditionalJump):
+                    targets = [last_stmt.true_target.value, last_stmt.false_target.value]
+                elif isinstance(last_stmt, Jump):
+                    targets = [last_stmt.target.value]
+                else:
+                    continue
+
+                # check if the jump targets of each node are present in all successors of node
+                all_succ = [suc.addr for suc in self.write_graph.successors(node)]
+                for value in targets:
+                    if value in all_succ:
+                        continue
+
+                    # if not, find that block, re-add it
+                    try:
+                        new_succ = find_block_by_addr(self.write_graph, value)
+                    except Exception:
+                        continue
+
+                    self.write_graph.add_edge(node, new_succ)
+                    updated = True
+                    break
+
+                if updated:
+                    break
+
+            else:
+                break
+
+        return False, True
+
+    def _post_deduplication_round(self):
+        """
+        self.write_graph = self.simple_optimize_graph(self.write_graph)
+        self._update_subregions(
+            set(node.addr for node in removable_nodes),
+            set(node.addr for node in merge_graph.nodes)
+        )
+        """
+        self.out_graph = self.write_graph
+
+
+    def generate_merge_targets(self, blocks, graph: nx.DiGraph) -> Tuple[nx.DiGraph, Dict[Block, MergeTarget]]:
+        """
+        We locate the merge target graph as well as the places they differ.
+        Consider merge graphs:
+        Gx:    [A, B, C] -> [D,E] -> [F]
+        Gy:    [C] -> [D,E] -> [F, E]
+
+        Each merge graph has pre-blocks and post-blocks that will be split off
+        Gx-Pre-Blocks: [[A,B]]
+        Gy-Pre-Blocks: [None]
+        Gx-Post-Blocks: [None]
+        Gy-Post-Blocks: [[E]]
+
+        Plan:
+        1. Do two graphs at a time and try to find the longest common block seq
+
+        @param blocks:
+        @param graph:
+        @return:
+        """
+        merge_targets: Dict[Block, MergeTarget] = {}
+        graph_lcs = longest_ail_graph_subseq(blocks, graph)
+
+        # collect original graphs with their starts and ends
+        merge_base = blocks[0]
+        merge_graph = None
+
+        for block in blocks:
+            orig_blocks, split_blocks = ail_similarity_to_orig_blocks(block, graph_lcs, graph)
+            removable_graph: nx.DiGraph = nx.subgraph(graph, orig_blocks)
+
+            og_to_split = {}
+            for og_block, split_info in split_blocks.items():
+                lcs, idx = split_info
+                og_to_split[og_block] = split_ail_block(og_block, idx, len(lcs))
+
+            # create a merge_graph on first iteration (will always execute once)
+            if block is merge_base and not merge_graph:
+                base_og_to_merge = {
+                    og: split[1]
+                    for og, split in og_to_split.items() if split[1] is not None
+                }
+
+                merge_graph = clone_graph_with_splits(removable_graph.copy(), base_og_to_merge)
+
+                # sanity checks we are not merging in a loop merge target
+                try:
+                    merge_start = [node for node in merge_graph.nodes if merge_graph.in_degree(node) == 0][0]
+                except IndexError:
+                    raise Exception("Unable to merge a merge-graph with no head node")
+
+                merge_ends = [node for node in merge_graph.nodes if merge_graph.out_degree(node) == 0]
+                merge_blocks, og_blocks = bfs_list_blocks(merge_start, merge_graph), bfs_list_blocks(merge_base, removable_graph)
+
+                base_to_merge_end = {
+                    og: merge_end for og, merge_end in zip(og_blocks, merge_blocks)
+                    if merge_end in merge_ends
+                }
+
+            # create merge start association
+            pred_map = {
+                (split[0] if split[0] else block): list(graph.predecessors(block))
+                for _, split in og_to_split.items()
+            }
+            if not pred_map:
+                pred_map = {block: list(graph.predecessors(block))}
+
+            pre_block_map = {
+                (split[0] if split[0] else block): block
+                for _, split in og_to_split.items()
+            }
+            if not pre_block_map:
+                pre_block_map = {block: block}
+
+            # create merge end association
+            merge_end_to_og = {}
+            block_pairs = ail_graph_similarity(block, merge_base, graph, only_blocks=True) \
+                if block is not merge_base else [(og, og) for og, _ in base_to_merge_end.items()]
+            for target_b, base_b in block_pairs:
+                try:
+                    merge_end = base_to_merge_end[base_b]
+                except KeyError:
+                    continue
+
+                merge_end_to_og[merge_end] = target_b
+
+            # record how an original merge graph target translates to the final graph output
+            original_ends_to_merge_ends = {
+                v: k for k,v in merge_end_to_og.items()
+            }
+
+            post_block_map = {
+                merge_end: og_to_split[og][2] for merge_end, og in merge_end_to_og.items()
+                if og in og_to_split and og_to_split[og][2]
+            }
+            succ_map = {
+                merge_end: list(graph.successors(og)) for merge_end, og in merge_end_to_og.items()
+            }
+            merge_targets[block] = MergeTarget(
+                pred_map,
+                pre_block_map,
+                post_block_map,
+                succ_map,
+                original_ends_to_merge_ends,
+                removable_graph,
             )
 
-        #breakpoint()
-        self.out_graph = self.write_graph #self.remove_simple_similar_blocks(self.write_graph)
+        # sanity check
+        # TODO: make this goto check better
+        # what we should be doing is checking that two ends with the same successor are
+        # connected with at least one goto
+        target_ends = self._find_merge_target_unique_ends(merge_targets)
+        for merge_start, ends in target_ends.items():
+            for end in ends:
+                for statement in end.statements:
+                    stmt_addr = statement.tags['ins_addr']
+                    if stmt_addr in self.goto_locations:
+                        merge_targets = self._update_target_successor_conditions(merge_targets)
+                        return merge_graph, merge_targets
+        else:
+            return None, None
+
+    def _find_merge_target_unique_ends(self, targets: Dict[Block, MergeTarget]):
+        target_to_ends: Dict[Block, Set[Block]] = defaultdict(set)
+
+        # first collect every end that was in the original graph that we merged
+        for blk, target in targets.items():
+            for node in target.original_graph.nodes:
+                successors = list(target.original_graph.successors(node))
+                if len(successors) == 0:
+                    target_to_ends[blk].add(node)
+
+        # now that we have all the ends, remove all the ends that are present in
+        # every graph ends. This signifies that the block is not actually duplicated
+        # but the SAME block at the ends of the graph. We don't want those.
+        changes = True
+        while changes:
+            changes = False
+            for blk, ends in target_to_ends.items():
+                for end in ends:
+                    if all([end in other_ends for other_ends in target_to_ends.values()]):
+                        changes = True
+                        for other_ends in target_to_ends.values():
+                            other_ends.remove(end)
+                        break
+
+                if changes:
+                    break
+
+        return target_to_ends
+
+    def _update_target_successor_conditions(self, targets: Dict[Block, MergeTarget]):
+        # first, start by reconstructing the original graph that the targets were located in.
+        # we want to reduce the graph here by only composing a graph containing important nodes which
+        # will include all the conditional nodes, the target starts, and the ending nodes (the graph).
+        trgt_blks = [start_vlk for start_vlk in targets]
+        common_cond = shared_common_conditional_dom(trgt_blks, self.read_graph)
+        graph_nodes = set(trgt_blks)
+
+        # add all the nodes in the duplicated graphs
+        for target in targets.values():
+            for node in target.original_graph.nodes:
+                graph_nodes.add(node)
+
+        # add all the nodes between the duplicated graphs and the common conditional
+        for trgt_blk in trgt_blks:
+            paths_between = nx.all_simple_paths(self.read_graph, source=common_cond, target=trgt_blk)
+            graph_nodes.update({node for path in paths_between for node in path})
+
+        # subpgraph using the old nodes
+        full_target_graph: nx.DiGraph = nx.DiGraph(nx.subgraph(self.read_graph, graph_nodes))
+
+        # destroy any edges which go to what is supposed to be the start node of the graph
+        # which in effect removes loops (hopefully)
+        while True:
+            try:
+                cycles = nx.find_cycle(full_target_graph)
+            except nx.NetworkXNoCycle:
+                break
+
+            full_target_graph.remove_edge(*cycles[0])
+
+        # now that we have a full target graph, we want to know the condensed conditions that allow
+        # control flow to get to that target end. We get the reaching conditions to construct a gaurding
+        # node later
+        self.ri.cond_proc.recover_reaching_conditions(None, graph=full_target_graph)
+        target_start_to_ends = self._find_merge_target_unique_ends(targets)
+        for blk, target in targets.items():
+            og_ends = target_start_to_ends[blk]
+            for og_end in og_ends:
+                merge_end = target.original_ends_map.get(og_end, None)
+                if not merge_end:
+                    continue
+
+                if blk in self.cond_proc.guarding_conditions:
+                    condition = self.cond_proc.guarding_conditions[blk]
+                elif blk in self.cond_proc.reaching_conditions:
+                    condition = self.cond_proc.reaching_conditions[blk]
+                else:
+                    raise Exception(f"Unable to find the conditions for target: {blk}")
+
+                condition = self.ri.cond_proc.simplify_condition(condition)
+                target.post_block_conditions[merge_end] = self.ri.cond_proc.convert_claripy_bool_ast(condition)
+
+        return targets
+
 
     #
     # Search Stages
@@ -1209,11 +1460,31 @@ class DuplicationOptReverter(OptimizationPass):
 
         return list(set(initial_candidates))
 
-    def _filter_candidates(self, candidates):
+    def _filter_candidates(self, candidates, merge_candidates=True):
         """
         Preform a series of filters on the candidates to reduce the fast set to an assured set of
         the duplication case we are searching for.
         """
+
+        #
+        # filter out bad candidates from the blacklist
+        #
+
+        while True:
+            removal = False
+            for bad_candidate in self.candidate_blacklist:
+                for candidate in candidates:
+                    # skip candidates in blacklist
+                    if all(bc in candidate for bc in bad_candidate):
+                        candidates.remove(candidate)
+                        removal = True
+                        break
+
+                if removal:
+                    break
+
+            else:
+                break
 
         #
         # First locate all the pairs that may actually be in a merge-graph of one of the already existent
@@ -1251,9 +1522,12 @@ class DuplicationOptReverter(OptimizationPass):
             if len(removal_queue) == 0:
                 break
 
-            print(f"removing descendant pairs: {removal_queue}")
+            l.debug(f"Removing descendant pair in candidate search: {removal_queue}")
             for pair in set(removal_queue):
                 candidates.remove(pair)
+
+        if not merge_candidates:
+            return candidates
 
         #
         # Now, merge pairs that may actually be n-pairs. This will look like multiple pairs having a single
