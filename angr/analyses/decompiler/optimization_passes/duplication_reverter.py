@@ -689,6 +689,9 @@ class MergeTarget:
         return str(self)
 
 
+class StructuringError(Exception):
+    pass
+
 #
 # Main Analysis
 #
@@ -713,6 +716,8 @@ class DuplicationOptReverter(OptimizationPass):
         self.write_graph = None
         self.candidate_blacklist = None
 
+        self.prev_graph = None
+
         self.analyze()
 
     def _check(self):
@@ -728,12 +733,14 @@ class DuplicationOptReverter(OptimizationPass):
         """
         try:
             self.deduplication_analysis(max_fix_attempts=30)
+        except StructuringError:
+            raise Exception(f"Structuring failed! This function is dead in the water!")
         except Exception as e:
             l.critical(f"Encountered an error while de-duplicating: {e}")
-            raise e
 
     def deduplication_analysis(self, max_fix_attempts=30):
         fix_round = 0
+        self.prev_graph = self._graph
         self.write_graph = self._graph
         self.candidate_blacklist = set()
 
@@ -760,10 +767,7 @@ class DuplicationOptReverter(OptimizationPass):
         else:
             raise Exception(f"Max fix attempts of {max_fix_attempts} done on function {self._func.name}")
 
-    def _pre_deduplication_round(self):
-        # reset gotos
-        self.kb.gotos.locations[self._func.addr] = set()
-
+    def _structure_graph(self):
         # do structuring
         self.ri = self.project.analyses[RegionIdentifier].prep(kb=self.kb)(
             self._func, graph=self.write_graph, cond_proc=self.ri.cond_proc, force_loop_single_exit=False,
@@ -776,8 +780,18 @@ class DuplicationOptReverter(OptimizationPass):
         )
         if not rs.result.nodes:
             l.critical("Failed to redo structuring")
+            return False
 
         self.project.analyses.RegionSimplifier(self._func, rs.result, kb=self.kb, variable_kb=self._variable_kb)
+        return True
+
+    def _pre_deduplication_round(self):
+        # reset gotos
+        self.kb.gotos.locations[self._func.addr] = set()
+
+        success = self._structure_graph()
+        if not success:
+            raise StructuringError
 
         # collect gotos
         self.goto_locations = {goto.addr for goto in self.kb.gotos.locations[self._func.addr]}
@@ -793,7 +807,7 @@ class DuplicationOptReverter(OptimizationPass):
         self.out_graph = self.write_graph
         self.candidate_blacklist = set()
 
-    def _deduplication_round(self, max_fixes=10):
+    def _deduplication_round(self):
         #
         # 0: Find candidates with duplicated AIL statements
         #
