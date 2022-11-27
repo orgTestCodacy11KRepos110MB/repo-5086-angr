@@ -24,7 +24,6 @@ from ... import AnalysesHub
 from ..ailblock_walker import AILBlockWalker
 
 l = logging.getLogger(__name__)
-l.setLevel(1)
 
 
 class PairAILBlockWalker:

@@ -8,12 +8,14 @@ import itertools
 import networkx
 import networkx as nx
 
+import ailment
 from ailment.block import Block
 from ailment.statement import Statement, ConditionalJump, Jump, Assignment
 from ailment.expression import Const, Register
 import claripy
 
 from .optimization_pass import OptimizationPass, OptimizationPassStage
+from ..condition_processor import ConditionProcessor
 from ..region_identifier import RegionIdentifier, GraphRegion, MultiNode
 from ..structuring import RecursiveStructurer, PhoenixStructurer
 from ....analyses.reaching_definitions.reaching_definitions import ReachingDefinitionsAnalysis
@@ -39,7 +41,7 @@ def find_block_by_similarity(block, graph, node_list=None):
             similar_blocks.append(other_block)
 
     if len(similar_blocks) > 1:
-        print("WARNING: found multiple similar blocks")
+        l.warning("found multiple similar blocks")
 
     return similar_blocks[0]
 
@@ -638,7 +640,7 @@ def remove_redundant_jumps(graph: nx.DiGraph):
                 graph.add_edge(pred, successor)
 
             graph.remove_node(target_blk)
-            print(f"REMOVING NODE IN SIMPLE_REDUNDANT: {target_blk}")
+            l.debug(f"REMOVING NODE IN SIMPLE_REDUNDANT: {target_blk}")
             change |= True
             break
         else:
@@ -705,9 +707,11 @@ class DuplicationOptReverter(OptimizationPass):
     def __init__(self, func, region_identifier=None, reaching_definitions=None, **kwargs):
         self.ri: RegionIdentifier = region_identifier
         self.rd: ReachingDefinitionsAnalysis = reaching_definitions
-        self.cond_proc = self.ri.cond_proc
-        self.goto_locations = None
         super().__init__(func, **kwargs)
+
+        self.goto_locations = None
+        self.write_graph = None
+        self.candidate_blacklist = None
 
         self.analyze()
 
@@ -723,17 +727,26 @@ class DuplicationOptReverter(OptimizationPass):
         Entry analysis routine that will trigger the other analysis stages
         """
         try:
-            self.deduplication_analysis(max_fix_attempts=10)
+            self.deduplication_analysis(max_fix_attempts=30)
         except Exception as e:
-            l.critical(f"Encountered an error while de-duplicating: {e.args[0]}")
+            l.critical(f"Encountered an error while de-duplicating: {e}")
+            raise e
 
-    def deduplication_analysis(self, max_fix_attempts=10):
+    def deduplication_analysis(self, max_fix_attempts=30):
         fix_round = 0
         self.write_graph = self._graph
         self.candidate_blacklist = set()
 
+        updates = True
         while fix_round <= max_fix_attempts:
-            self._pre_deduplication_round()
+            fix_round += 1
+
+            if updates:
+                no_gotos = self._pre_deduplication_round()
+                if no_gotos:
+                    l.info("There are no gotos in this function.")
+                    return
+
             l.info(f"Running analysis round: {fix_round}")
             fake_duplication, updates = self._deduplication_round()
             if fake_duplication:
@@ -744,11 +757,6 @@ class DuplicationOptReverter(OptimizationPass):
 
             l.info(f"Writing to outgraph now")
             self._post_deduplication_round()
-            fix_round += 1
-
-            # XXX: remmove
-            if fix_round == 2:
-                break
         else:
             raise Exception(f"Max fix attempts of {max_fix_attempts} done on function {self._func.name}")
 
@@ -757,20 +765,33 @@ class DuplicationOptReverter(OptimizationPass):
         self.kb.gotos.locations[self._func.addr] = set()
 
         # do structuring
+        self.ri = self.project.analyses[RegionIdentifier].prep(kb=self.kb)(
+            self._func, graph=self.write_graph, cond_proc=self.ri.cond_proc, force_loop_single_exit=False,
+        )
         rs = self.project.analyses[RecursiveStructurer].prep(kb=self.kb)(
             deepcopy(self.ri.region),
             cond_proc=self.ri.cond_proc,
             func=self._func,
             structurer_cls=PhoenixStructurer
         )
+        if not rs.result.nodes:
+            l.critical("Failed to redo structuring")
+
         self.project.analyses.RegionSimplifier(self._func, rs.result, kb=self.kb, variable_kb=self._variable_kb)
 
         # collect gotos
         self.goto_locations = {goto.addr for goto in self.kb.gotos.locations[self._func.addr]}
+        if not self.goto_locations:
+            return True
 
         # optimize the graph?
         self.write_graph = self.simple_optimize_graph(self.write_graph)
         self.read_graph = self.write_graph.copy()
+        return False
+
+    def _post_deduplication_round(self):
+        self.out_graph = self.write_graph
+        self.candidate_blacklist = set()
 
     def _deduplication_round(self, max_fixes=10):
         #
@@ -820,31 +841,7 @@ class DuplicationOptReverter(OptimizationPass):
         self.write_graph = nx.compose(self.write_graph, merge_graph)
 
         #
-        # 3: clone the conditional graph
-        #
-
-        """
-        merge_end_to_cond_graph = {}
-        common_node_addr = shared_common_conditional_dom(candidate, self.read_graph).statements[-1].tags['ins_addr']
-        # guarantees at least a single run
-        for i, merge_end in enumerate(merge_ends):
-
-            # merge ends with no post blocks need no graph
-            if all(merge_end not in trgt.post_block_map for _, trgt in merge_targets.items()):
-                continue
-
-            cond_graph, pre_graph_map = self.copy_cond_graph(candidate, self.read_graph, idx=i + 1*curr_iter)
-            try:
-                root_cond = [node for node in cond_graph.nodes if cond_graph.in_degree(node) == 0][0]
-            except IndexError:
-                print("This duplication is in a looping condition, using a node estimate")
-                root_cond = find_block_by_addr(cond_graph, common_node_addr)
-
-            merge_end_to_cond_graph[merge_end] = (root_cond, cond_graph)
-        """
-
-        #
-        # 4: replace the edges from the preds to the pre block
+        # 3: replace the edges from the preds to the pre block
         #
 
         for _, merge_target in merge_targets.items():
@@ -863,20 +860,8 @@ class DuplicationOptReverter(OptimizationPass):
                 if new_block == pre_blk and pre_blk != merge_start:
                     self.write_graph.add_edge(pre_blk, merge_start)
         #
-        # 5: make the merge graph ends point to conditional graph copies
-        #
-
-        """
-        for merge_end, cond_graph_info in merge_end_to_cond_graph.items():
-            cond_root, cond_graph = cond_graph_info
-            self.block_blacklist.update({blk for blk in cond_graph.nodes})
-            self.write_graph = nx.compose(self.write_graph, cond_graph)
-            self.write_graph.add_edge(merge_end, cond_root)
-        """
+        # 4: construct condition blocks based on reaching conditions of the original graph
         # XXX: this code assumes the candidate is only 2 graphs max, n graphs do not work.
-
-        #
-        # A: make merged conditions
         #
 
         merged_conditions = {}
@@ -886,16 +871,19 @@ class DuplicationOptReverter(OptimizationPass):
                 if post_block is None:
                     continue
 
-                if merge_end in merged_conditions:
+                post_condition = merge_target.post_block_conditions[merge_end]
+                merged_condition = merged_conditions.get(merge_end, None)
+                if isinstance(post_condition, Const) or merged_condition is not None:
                     continue
-                else:
-                    merged_conditions[merge_end] = (
-                        merge_target.post_block_conditions[merge_end],
-                        merge_target
-                    )
+
+                merged_conditions[merge_end] = (
+                    post_condition,
+                    merge_target
+                )
 
         #
-        # B: point them to the right places
+        # 5: point merge-graph ends to the new conditional block and the conditional block
+        #    to the correct post blocks
         #
 
         post_cond_graphs: Dict[Block, nx.DiGraph] = defaultdict(nx.DiGraph)
@@ -940,38 +928,7 @@ class DuplicationOptReverter(OptimizationPass):
             post_cond_graphs[merge_end].add_edge(merge_end, cond_block)
 
         #
-        # 6: make the new conditionals point to the post-block
-        #
-
-        """
-        for merge_end, cond_graph_info in merge_end_to_cond_graph.items():
-            cond_root, cond_graph = cond_graph_info
-
-            for block, merge_target in merge_targets.items():
-                try:
-                    new_block = merge_target.post_block_map[merge_end]
-                except KeyError:
-                    new_block = merge_target.successor_map[merge_end][0] \
-                        if len(merge_target.successor_map[merge_end]) > 0 else None
-
-                # skip conditionals that actually have no continuation
-                if not new_block:
-                    continue
-
-                for cond in cond_graph.nodes:
-                    last_stmt = cond.statements[-1]
-                    cond.statements[-1] = correct_jump_targets(
-                        last_stmt,
-                        {block.addr: new_block.addr}
-                    )
-
-                    if (isinstance(last_stmt, ConditionalJump) and new_block.addr in (last_stmt.true_target.value, last_stmt.false_target.value)) \
-                            or (isinstance(last_stmt, Jump) and new_block.addr == last_stmt.target.value):
-                        self.write_graph.add_edge(cond, new_block)
-        """
-
-        #
-        # 7: make the post blocks continue to the next successors
+        # 6: make the post blocks continue to the next successors
         #
 
         post_is_condition = {}
@@ -988,23 +945,40 @@ class DuplicationOptReverter(OptimizationPass):
                 for suc in merge_target.successor_map[merge_end]:
                     self.write_graph.add_edge(post_block, suc)
 
-
         #
-        # XXX: C (from part A and B above) extra fix pass for post blocks that are also conditional blocks
+        # FIXUP1: Extra fix pass for post blocks that are also conditional blocks
         #
 
-        # TODO: this does not always work, go see true_localcharset why
         if post_is_condition:
             for merge_target, block_tup in post_is_condition.items():
                 merge_end, post_block = block_tup
+
+                # do a sanity check to verify that the successors of the conditional block we are about to
+                # merge actually have the same successors and the earlier conditional block.
+                post_successors = list(self.write_graph.successors(post_block))
+                post_preds = list(self.write_graph.predecessors(post_block))
+                if len(post_preds) != 1:
+                    continue
+                conditional_pred = post_preds[0]
+                cond_pred_stmt: ConditionalJump = conditional_pred.statements[-1]
+                post_stmt: ConditionalJump = post_block.statements[-1]
+                if cond_pred_stmt.true_target.value != post_block.addr and \
+                        cond_pred_stmt.false_target != post_block.addr:
+                    continue
+                elif cond_pred_stmt.true_target.value != post_stmt.true_target.value and \
+                        cond_pred_stmt.false_target.value != post_stmt.false_target.value:
+                    continue
+
+                # now that we know the blocks should have conditional overlaps, they should be safe
+                # to remove
                 nodes_between = set()
-                for suc in self.write_graph.successors(post_block):
+                for suc in post_successors:
                     paths_between = nx.all_simple_paths(self.write_graph, source=merge_end, target=suc)
                     nodes_between = {node for path in paths_between for node in path}
 
                 post_cond_graph = nx.subgraph(self.write_graph, nodes_between)
                 try:
-                    self.cond_proc.recover_reaching_conditions(None, graph=post_cond_graph)
+                    self.ri.cond_proc.recover_reaching_conditions(None, graph=post_cond_graph)
                 except Exception:
                     continue
 
@@ -1015,18 +989,17 @@ class DuplicationOptReverter(OptimizationPass):
                 self.write_graph.remove_nodes_from(list(post_cond_graph.predecessors(post_block)))
 
                 for suc in post_cond_graph.successors(post_block):
-                    guard_condition = self.cond_proc.guarding_conditions.get(suc, None)
+                    guard_condition = self.ri.cond_proc.guarding_conditions.get(suc, None)
                     if not guard_condition:
                         continue
 
-                    cond_block.statements[-1].condition = self.cond_proc.convert_claripy_bool_ast(guard_condition)
+                    cond_block.statements[-1].condition = self.ri.cond_proc.convert_claripy_bool_ast(guard_condition)
                     break
 
                 self.write_graph.add_edge(merge_end, cond_block)
 
-
         #
-        # 8: AD-HOC-FIX nodes that could've been modified (fixed point)
+        # FIXUP2: Fix nodes that could've been modified from copying (fixed point)
         #
 
         while True:
@@ -1072,17 +1045,6 @@ class DuplicationOptReverter(OptimizationPass):
                 break
 
         return False, True
-
-    def _post_deduplication_round(self):
-        """
-        self.write_graph = self.simple_optimize_graph(self.write_graph)
-        self._update_subregions(
-            set(node.addr for node in removable_nodes),
-            set(node.addr for node in merge_graph.nodes)
-        )
-        """
-        self.out_graph = self.write_graph
-
 
     def generate_merge_targets(self, blocks, graph: nx.DiGraph) -> Tuple[nx.DiGraph, Dict[Block, MergeTarget]]:
         """
@@ -1191,7 +1153,7 @@ class DuplicationOptReverter(OptimizationPass):
                 removable_graph,
             )
 
-        # sanity check
+        # only allow merge targets for those that end in goto
         # TODO: make this goto check better
         # what we should be doing is checking that two ends with the same successor are
         # connected with at least one goto
@@ -1232,6 +1194,14 @@ class DuplicationOptReverter(OptimizationPass):
 
                 if changes:
                     break
+
+        # should all ends happen to be empty, this actually means that it's a graph
+        # duplication where all the post blocks ARE the same block. In such a case,
+        # we assume the start block is the end block
+        if all(len(ends) == 0 for ends in target_to_ends.values()):
+            target_to_ends = {
+                k: {k} for k in target_to_ends.keys()
+            }
 
         return target_to_ends
 
@@ -1278,14 +1248,19 @@ class DuplicationOptReverter(OptimizationPass):
                 if not merge_end:
                     continue
 
-                if blk in self.cond_proc.guarding_conditions:
-                    condition = self.cond_proc.guarding_conditions[blk]
-                elif blk in self.cond_proc.reaching_conditions:
-                    condition = self.cond_proc.reaching_conditions[blk]
+                if blk in self.ri.cond_proc.guarding_conditions:
+                    condition = self.ri.cond_proc.guarding_conditions[blk]
+                elif blk in self.ri.cond_proc.reaching_conditions:
+                    condition = self.ri.cond_proc.reaching_conditions[blk]
                 else:
                     raise Exception(f"Unable to find the conditions for target: {blk}")
 
                 condition = self.ri.cond_proc.simplify_condition(condition)
+                if condition.is_true() or condition.is_false():
+                    condition = self.ri.cond_proc.simplify_condition(
+                        self.ri.cond_proc.reaching_conditions[blk]
+                    )
+
                 target.post_block_conditions[merge_end] = self.ri.cond_proc.convert_claripy_bool_ast(condition)
 
         return targets
@@ -1400,10 +1375,6 @@ class DuplicationOptReverter(OptimizationPass):
     def _find_initial_candidates(self) -> List[Tuple[Block, Block]]:
         initial_candidates = list()
         for b0, b1 in combinations(self.read_graph.nodes, 2):
-            if all(b.addr in [0x40123f, 0x4011d6] for b in [b0, b1]):
-                #breakpoint()
-                pass
-
             # TODO: find a better fix for this! Some duplicated nodes need destruction!
             # skip purposefully duplicated nodes
             #if any(isinstance(b.idx, int) and b.idx > 0 for b in [b0, b1]):
@@ -1451,12 +1422,13 @@ class DuplicationOptReverter(OptimizationPass):
                     # only append pairs that share a dominator
                     if shared_common_conditional_dom(pair, self.read_graph) is not None:
                         initial_candidates.append(pair)
-                    else:
-                        print(f"### COMMON PAIR {pair} don't share a common Conditional Dom")
 
                     break
 
-        return list(set(initial_candidates))
+        initial_candidates = list(set(initial_candidates))
+        initial_candidates.sort(key=lambda x: x[0].addr + x[1].addr)
+
+        return initial_candidates
 
     def _filter_candidates(self, candidates, merge_candidates=True):
         """
@@ -1629,7 +1601,7 @@ class DuplicationOptReverter(OptimizationPass):
             if not remove_queue:
                 break
 
-            print(f"REMOVING IN SIMPLE_DUP: {remove_queue}")
+            l.debug(f"REMOVING IN SIMPLE_DUP: {remove_queue}")
             for b0, b1 in remove_queue:
                 if not (graph.has_node(b0) or graph.has_node(b1)):
                     continue
