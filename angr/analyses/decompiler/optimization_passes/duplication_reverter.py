@@ -717,6 +717,9 @@ class DuplicationOptReverter(OptimizationPass):
         self.candidate_blacklist = None
 
         self.prev_graph = None
+        self.func_name = self._func.name
+        self.binary_name = self.project.loader.main_object.binary_basename
+        self.target_name = f"{self.binary_name}.{self.func_name}"
 
         self.analyze()
 
@@ -734,9 +737,9 @@ class DuplicationOptReverter(OptimizationPass):
         try:
             self.deduplication_analysis(max_fix_attempts=30)
         except StructuringError:
-            raise Exception(f"Structuring failed! This function is dead in the water!")
+            raise Exception(f"Structuring failed! This function {self.target_name} is dead in the water!")
         except Exception as e:
-            l.critical(f"Encountered an error while de-duplicating: {e}")
+            l.critical(f"Encountered an error while de-duplicating on {self.target_name}: {e}")
 
     def deduplication_analysis(self, max_fix_attempts=30):
         fix_round = 0
@@ -751,10 +754,10 @@ class DuplicationOptReverter(OptimizationPass):
             if updates:
                 no_gotos = self._pre_deduplication_round()
                 if no_gotos:
-                    l.info("There are no gotos in this function.")
+                    l.info(f"There are no gotos in this function {self.target_name}")
                     return
 
-            l.info(f"Running analysis round: {fix_round}")
+            l.info(f"Running analysis round: {fix_round} on {self.target_name}")
             fake_duplication, updates = self._deduplication_round()
             if fake_duplication:
                 continue
@@ -762,10 +765,10 @@ class DuplicationOptReverter(OptimizationPass):
             if not updates:
                 return
 
-            l.info(f"Writing to outgraph now")
+            l.info(f"Round {fix_round} successful on {self.target_name}. Writing to graph now...")
             self._post_deduplication_round()
         else:
-            raise Exception(f"Max fix attempts of {max_fix_attempts} done on function {self._func.name}")
+            raise Exception(f"Max fix attempts of {max_fix_attempts} done on function {self.target_name}")
 
     def _structure_graph(self):
         # do structuring
@@ -779,7 +782,7 @@ class DuplicationOptReverter(OptimizationPass):
             structurer_cls=PhoenixStructurer
         )
         if not rs.result.nodes:
-            l.critical("Failed to redo structuring")
+            l.critical(f"Failed to redo structuring on {self.target_name}")
             return False
 
         self.project.analyses.RegionSimplifier(self._func, rs.result, kb=self.kb, variable_kb=self._variable_kb)
@@ -835,7 +838,7 @@ class DuplicationOptReverter(OptimizationPass):
 
         merge_graph, merge_targets = self.generate_merge_targets(candidate, self.read_graph)
         if merge_graph is None or merge_targets is None:
-            l.info(f"Chosen candidate {candidate} was not connected with a goto")
+            l.info(f"Chosen candidate {candidate} was not connected with a goto on {self.target_name}, skipping...")
             self.candidate_blacklist.add(candidate)
             return True, False
 
