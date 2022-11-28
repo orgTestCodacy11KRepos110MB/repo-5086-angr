@@ -1167,20 +1167,31 @@ class DuplicationOptReverter(OptimizationPass):
                 removable_graph,
             )
 
+        if self._start_or_end_contains_goto(merge_targets):
+            merge_targets = self._update_target_successor_conditions(merge_targets)
+            return merge_graph, merge_targets
+        else:
+            return None, None
+
+    def _start_or_end_contains_goto(self, merge_targets):
         # only allow merge targets for those that end in goto
         # TODO: make this goto check better
         # what we should be doing is checking that two ends with the same successor are
         # connected with at least one goto
         target_ends = self._find_merge_target_unique_ends(merge_targets)
         for merge_start, ends in target_ends.items():
+            # if goto edge coming from start block (which is a conditional block)
+            if merge_start.statements[-1].tags['ins_addr'] in self.goto_locations:
+                return True
+
+            # if goto edge coming from end block (which can be conditional or non-conditional)
             for end in ends:
-                for statement in end.statements:
-                    stmt_addr = statement.tags['ins_addr']
-                    if stmt_addr in self.goto_locations:
-                        merge_targets = self._update_target_successor_conditions(merge_targets)
-                        return merge_graph, merge_targets
-        else:
-            return None, None
+                for stmt in end.statements:
+                    # some instruction addrs can move... just check them all (lol)
+                    if stmt.tags['ins_addr'] in self.goto_locations:
+                        return True
+
+        return False
 
     def _find_merge_target_unique_ends(self, targets: Dict[Block, MergeTarget]):
         target_to_ends: Dict[Block, Set[Block]] = defaultdict(set)
