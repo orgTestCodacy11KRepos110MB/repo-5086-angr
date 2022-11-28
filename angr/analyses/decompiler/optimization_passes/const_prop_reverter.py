@@ -140,20 +140,29 @@ class ConstPropOptReverter(OptimizationPass):
         self.rd = reaching_definitions
         super().__init__(func, **kwargs)
 
+        self.write_graph = None
+        self.resolution = False
         self.analyze()
 
     def _check(self):
         return True, {}
 
     def _analyze(self, cache=None):
+        self.resolution = False
         self.out_graph = to_ail_supergraph(self._graph)
 
         _pair_stmt_handlers = {
             Call: self._handle_Call_pair,
         }
 
+        if self.out_graph is None:
+            return
+
         walker = PairAILBlockWalker(self.out_graph, stmt_pair_handlers=_pair_stmt_handlers)
         walker.walk()
+
+        if not self.resolution:
+            self.out_graph = None
 
     #
     # Handle Similar Calls
@@ -227,6 +236,7 @@ class ConstPropOptReverter(OptimizationPass):
             const_call = calls[const_arg]
             const_arg_i = const_call.args.index(const_arg)
             const_call.args[const_arg_i] = sym_arg
+            self.resolution = True
 
     @staticmethod
     def find_conflicting_call_args(call0: Call, call1: Call):
