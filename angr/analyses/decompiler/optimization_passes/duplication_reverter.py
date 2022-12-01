@@ -737,13 +737,12 @@ class DuplicationOptReverter(OptimizationPass):
         try:
             self.deduplication_analysis(max_fix_attempts=30)
         except StructuringError:
-            raise Exception(f"Structuring failed! This function {self.target_name} is dead in the water!")
+            l.critical(f"Structuring failed! This function {self.target_name} is dead in the water!")
         except Exception as e:
             l.critical(f"Encountered an error while de-duplicating on {self.target_name}: {e}")
 
     def deduplication_analysis(self, max_fix_attempts=30):
         fix_round = 0
-        self.prev_graph = self._graph
         self.write_graph = to_ail_supergraph(self._graph)
         self.candidate_blacklist = set()
 
@@ -794,6 +793,9 @@ class DuplicationOptReverter(OptimizationPass):
 
         success = self._structure_graph()
         if not success:
+            if self.prev_graph is not None:
+                self.out_graph = self.prev_graph
+
             raise StructuringError
 
         # collect gotos
@@ -807,6 +809,7 @@ class DuplicationOptReverter(OptimizationPass):
         return False
 
     def _post_deduplication_round(self):
+        self.prev_graph = self.out_graph.copy() if self.out_graph is not None else self._graph
         self.out_graph = self.write_graph
         self.candidate_blacklist = set()
 
