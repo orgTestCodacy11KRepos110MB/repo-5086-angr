@@ -6,12 +6,14 @@ import inspect
 
 import networkx
 
+import ailment
 from ailment.statement import Jump
 from ailment.expression import Const
+from .. import RegionIdentifier
 
 from ..condition_processor import ConditionProcessor, EmptyBlockNotice
 from .optimization_pass import OptimizationPass, OptimizationPassStage
-
+from ..structuring import RecursiveStructurer, PhoenixStructurer
 
 _l = logging.getLogger(name=__name__)
 
@@ -58,6 +60,7 @@ class EagerReturnsSimplifier(OptimizationPass):
         max_level=2,
         min_indegree=2,
         reaching_definitions=None,
+        region_identifier=None,
         **kwargs,
     ):
 
@@ -69,7 +72,13 @@ class EagerReturnsSimplifier(OptimizationPass):
         self.min_indegree = min_indegree
         self.node_idx = count(start=node_idx_start)
         self._rd = reaching_definitions
+        self.ri = region_identifier
 
+        self.goto_locations = None
+        self.func_name = self._func.name
+        self.binary_name = self.project.loader.main_object.binary_basename
+        self.target_name = f"{self.binary_name}.{self.func_name}"
+        self.graph_copy = None
         self.analyze()
 
     def _check(self):
@@ -86,19 +95,58 @@ class EagerReturnsSimplifier(OptimizationPass):
 
         # for each block with no successors and more than 1 predecessors, make copies of this block and link it back to
         # the sources of incoming edges
-        graph_copy = networkx.DiGraph(self._graph)
+        self.graph_copy = networkx.DiGraph(self._graph)
         graph_updated = False
 
         # attempt at most N levels
         for _ in range(self.max_level):
-            r = self._analyze_core(graph_copy)
+            graph_has_gotos = self._structure_graph()
+            if not graph_has_gotos:
+                _l.debug("Graph has no gotos. Leaving analysis...")
+                break
+
+            r = self._analyze_core(self.graph_copy)
             if not r:
                 break
             graph_updated = True
 
         # the output graph
         if graph_updated:
-            self.out_graph = graph_copy
+            self.out_graph = self.graph_copy
+
+    #
+    # taken from deduplicator
+    #
+
+    def _structure_graph(self):
+        # reset gotos
+        self.kb.gotos.locations[self._func.addr] = set()
+
+        # do structuring
+        self.ri = self.project.analyses[RegionIdentifier].prep(kb=self.kb)(
+            self._func, graph=self.graph_copy, cond_proc=self.ri.cond_proc, force_loop_single_exit=False,
+        )
+        rs = self.project.analyses[RecursiveStructurer].prep(kb=self.kb)(
+            copy.deepcopy(self.ri.region),
+            cond_proc=self.ri.cond_proc,
+            func=self._func,
+            structurer_cls=PhoenixStructurer
+        )
+        if not rs.result.nodes:
+            _l.critical(f"Failed to redo structuring on {self.target_name}")
+            return False
+
+        self.project.analyses.RegionSimplifier(self._func, rs.result, kb=self.kb, variable_kb=self._variable_kb)
+
+        # collect gotos
+        self.goto_locations = {goto.addr for goto in self.kb.gotos.locations[self._func.addr]}
+        return len(self.goto_locations) != 0
+
+    def _block_has_goto_edge(self, block: ailment.Block):
+        if block.addr in self.goto_locations or \
+                any(stmt.tags['ins_addr'] in self.goto_locations for stmt in block.statements):
+            return True
+
 
     def _analyze_core(self, graph: networkx.DiGraph):
 
@@ -145,8 +193,13 @@ class EagerReturnsSimplifier(OptimizationPass):
 
         for region_head, (in_edges, region) in to_update.items():
             # update the graph
+            removed_edges = list()
             for in_edge in in_edges:
                 pred_node = in_edge[0]
+                if not self._block_has_goto_edge(pred_node):
+                    continue
+
+                removed_edges.append(in_edge)
 
                 # Modify the graph and then add an edge to the copy of the region
                 copies = {}
@@ -173,8 +226,11 @@ class EagerReturnsSimplifier(OptimizationPass):
                     for succ in region.successors(node):
                         queue.append((node_copy, succ))
 
+            if not removed_edges:
+                continue
+
             # remove all in-edges
-            graph.remove_edges_from(in_edges)
+            graph.remove_edges_from(removed_edges)
             # remove the node to be copied
             graph.remove_nodes_from(region)
             graph_changed = True

@@ -36,7 +36,7 @@ _all_optimization_passes = [
     (ExprOpSwapper, True),
     (ConstPropOptReverter, True),
     (DuplicationOptReverter, True),
-    (EagerReturnsSimplifier, False),
+    (EagerReturnsSimplifier, True),
 ]
 
 
