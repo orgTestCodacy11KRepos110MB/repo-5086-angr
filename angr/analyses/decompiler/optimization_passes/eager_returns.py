@@ -96,22 +96,29 @@ class EagerReturnsSimplifier(OptimizationPass):
         # for each block with no successors and more than 1 predecessors, make copies of this block and link it back to
         # the sources of incoming edges
         self.graph_copy = networkx.DiGraph(self._graph)
+        self.last_graph = None
         graph_updated = False
 
         # attempt at most N levels
         for _ in range(self.max_level):
-            graph_has_gotos = self._structure_graph()
+            success, graph_has_gotos = self._structure_graph()
+            if not success:
+                self.graph_copy = self.last_graph
+                break
+
             if not graph_has_gotos:
                 _l.debug("Graph has no gotos. Leaving analysis...")
                 break
 
+            # make a clone of graph copy to recover in the event of failure
+            self.last_graph = self.graph_copy.copy()
             r = self._analyze_core(self.graph_copy)
             if not r:
                 break
             graph_updated = True
 
         # the output graph
-        if graph_updated:
+        if graph_updated and self.graph_copy is not None:
             self.out_graph = self.graph_copy
 
     #
@@ -134,13 +141,13 @@ class EagerReturnsSimplifier(OptimizationPass):
         )
         if not rs.result.nodes:
             _l.critical(f"Failed to redo structuring on {self.target_name}")
-            return False
+            return False, False
 
         self.project.analyses.RegionSimplifier(self._func, rs.result, kb=self.kb, variable_kb=self._variable_kb)
 
         # collect gotos
         self.goto_locations = {goto.addr for goto in self.kb.gotos.locations[self._func.addr]}
-        return len(self.goto_locations) != 0
+        return True, len(self.goto_locations) != 0
 
     def _block_has_goto_edge(self, block: ailment.Block):
         if block.addr in self.goto_locations or \

@@ -692,6 +692,10 @@ class MergeTarget:
 class StructuringError(Exception):
     pass
 
+
+class SAILRError(Exception):
+    pass
+
 #
 # Main Analysis
 #
@@ -740,8 +744,9 @@ class DuplicationOptReverter(OptimizationPass):
             l.critical(f"Structuring failed! This function {self.target_name} is dead in the water!")
         except Exception as e:
             l.critical(f"Encountered an error while de-duplicating on {self.target_name}: {e}")
+            raise e
 
-    def deduplication_analysis(self, max_fix_attempts=30):
+    def deduplication_analysis(self, max_fix_attempts=30, max_guarding_conditions=10):
         fix_round = 0
         self.write_graph = to_ail_supergraph(self._graph)
         self.candidate_blacklist = set()
@@ -757,7 +762,7 @@ class DuplicationOptReverter(OptimizationPass):
                     return
 
             l.info(f"Running analysis round: {fix_round} on {self.target_name}")
-            fake_duplication, updates = self._deduplication_round()
+            fake_duplication, updates = self._deduplication_round(max_guarding_conditions=max_guarding_conditions)
             if fake_duplication:
                 continue
 
@@ -813,7 +818,7 @@ class DuplicationOptReverter(OptimizationPass):
         self.out_graph = self.write_graph
         self.candidate_blacklist = set()
 
-    def _deduplication_round(self):
+    def _deduplication_round(self, max_guarding_conditions=10):
         #
         # 0: Find candidates with duplicated AIL statements
         #
@@ -892,14 +897,26 @@ class DuplicationOptReverter(OptimizationPass):
                     continue
 
                 post_condition = merge_target.post_block_conditions[merge_end]
-                merged_condition = merged_conditions.get(merge_end, None)
-                if isinstance(post_condition, Const) or merged_condition is not None:
+                merged_condition, _ = merged_conditions.get(merge_end, (None, None))
+                if isinstance(post_condition, Const):
+                    continue
+
+                # only allow an overwrite of condition if its a shorter condition
+                if merged_condition is not None and post_condition.depth >= merged_condition.depth:
                     continue
 
                 merged_conditions[merge_end] = (
                     post_condition,
                     merge_target
                 )
+
+        # check for fixups that will make decompilation look worse
+        for blk, merged_condition_info in merged_conditions.items():
+            merged_condition, target = merged_condition_info
+            if merged_condition.depth >= max_guarding_conditions:
+                self.candidate_blacklist.add(candidate)
+                l.warning(f"Attempted to make a fix that would cause a MASSIVE condition, skipping this candidate: {[hex(c.addr) for c in candidate]}")
+                return True, False
 
         #
         # 5: point merge-graph ends to the new conditional block and the conditional block
