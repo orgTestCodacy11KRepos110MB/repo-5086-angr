@@ -10,7 +10,7 @@ import networkx as nx
 
 import ailment
 from ailment.block import Block
-from ailment.statement import Statement, ConditionalJump, Jump, Assignment
+from ailment.statement import Statement, ConditionalJump, Jump, Assignment, Label
 from ailment.expression import Const, Register
 import claripy
 
@@ -33,6 +33,60 @@ l.setLevel(1)
 # Graph Utils
 #
 
+def remove_labels(graph: nx.DiGraph):
+    new_graph = nx.DiGraph()
+    nodes_map = {}
+    for node in graph:
+        node_copy = node.copy()
+        node_copy.statements = [stmt for stmt in node_copy.statements if not isinstance(stmt, Label)]
+        nodes_map[node] = node_copy
+
+    new_graph.add_nodes_from(nodes_map.values())
+    for src, dst in graph.edges:
+        new_graph.add_edge(nodes_map[src], nodes_map[dst])
+
+    return new_graph
+
+
+def add_labels(graph: nx.DiGraph):
+    """
+    new_graph = copy_graph_and_nodes(graph)
+    for node in new_graph.nodes:
+        node: ailment.Block
+        lbl = ailment.Stmt.Label(None, f"LABEL_{node.addr:x}", node.addr, block_idx=node.idx)
+        node.statements.insert(0, lbl)
+
+    return new_graph
+    """
+    """
+    new_graph = networkx.DiGraph()
+    for node in graph.nodes:
+        lbl = ailment.Stmt.Label(None, f"LABEL_{node.addr:x}", node.addr, block_idx=node.idx)
+        new_graph.add_node(
+            ail_block_from_stmts([lbl] + node.statements, block_addr=node.addr)
+        )
+
+    for edge in graph.edges:
+        old_b0, old_b1 = edge
+        b0, b1 = find_block_by_addr(new_graph, old_b0.addr), find_block_by_addr(new_graph, old_b1.addr)
+        new_graph.add_edge(b0, b1)
+    
+    return new_graph
+    """
+    new_graph = nx.DiGraph()
+    nodes_map = {}
+    for node in graph:
+        lbl = ailment.Stmt.Label(None, f"LABEL_{node.addr:x}", node.addr, block_idx=node.idx)
+        node_copy = node.copy()
+        node_copy.statements = [lbl] + node_copy.statements
+        nodes_map[node] = node_copy
+
+    new_graph.add_nodes_from(nodes_map.values())
+    for src, dst in graph.edges:
+        new_graph.add_edge(nodes_map[src], nodes_map[dst])
+
+    return new_graph
+
 def find_block_by_similarity(block, graph, node_list=None):
     nodes = node_list if node_list else list(graph.nodes())
     similar_blocks = []
@@ -48,7 +102,7 @@ def find_block_by_similarity(block, graph, node_list=None):
 
 def find_block_by_addr(graph: networkx.DiGraph, addr, insn_addr=False):
     if insn_addr:
-        def _get_addr(b): return b.statements[0].tags["ins_addr"]
+        def _get_addr(b): return b.statements[0].ins_addr
     else:
         def _get_addr(b): return b.addr
 
@@ -305,7 +359,7 @@ def ail_block_from_stmts(stmts, idx=None, block_addr=None) -> Optional[Block]:
     first_stmt = stmts[0]
 
     return Block(
-        first_stmt.tags['ins_addr'] if not block_addr else block_addr,
+        first_stmt.ins_addr if not block_addr else block_addr,
         0,
         statements=[stmt for stmt in stmts],
         idx=idx or 1,
@@ -744,11 +798,12 @@ class DuplicationOptReverter(OptimizationPass):
             l.critical(f"Structuring failed! This function {self.target_name} is dead in the water!")
         except Exception as e:
             l.critical(f"Encountered an error while de-duplicating on {self.target_name}: {e}")
-            raise e
+        if self.out_graph:
+            self.out_graph = add_labels(self.out_graph)
 
     def deduplication_analysis(self, max_fix_attempts=30, max_guarding_conditions=10):
         fix_round = 0
-        self.write_graph = to_ail_supergraph(self._graph)
+        self.write_graph = remove_labels(to_ail_supergraph(self._graph))
         self.candidate_blacklist = set()
 
         updates = True
@@ -776,6 +831,7 @@ class DuplicationOptReverter(OptimizationPass):
 
     def _structure_graph(self):
         # do structuring
+        self.write_graph = add_labels(self.write_graph)
         self.ri = self.project.analyses[RegionIdentifier].prep(kb=self.kb)(
             self._func, graph=self.write_graph, cond_proc=self.ri.cond_proc, force_loop_single_exit=False,
         )
@@ -785,6 +841,7 @@ class DuplicationOptReverter(OptimizationPass):
             func=self._func,
             structurer_cls=PhoenixStructurer
         )
+        self.write_graph = remove_labels(self.write_graph)
         if not rs.result.nodes:
             l.critical(f"Failed to redo structuring on {self.target_name}")
             return False
@@ -929,7 +986,10 @@ class DuplicationOptReverter(OptimizationPass):
 
             # rip off an old blocks information
             old_stmt_tags = merge_end.statements[0].tags
-            old_stmt_tags['ins_addr'] += 1
+            if 'ins_addr' in old_stmt_tags:
+                old_stmt_tags['ins_addr'] += 1
+            else:
+                old_stmt_tags['ins_addr'] = merge_end.statements[0].ins_addr + 1
             cond_block = Block(merge_end.addr+1, 1, idx=1)
 
             # create a new condition
@@ -1127,12 +1187,16 @@ class DuplicationOptReverter(OptimizationPass):
                 }
 
                 merge_graph = clone_graph_with_splits(removable_graph.copy(), base_og_to_merge)
+                if len(merge_graph.nodes) == 0:
+                    l.warning(f"This target had no statements in common. This may be an error in algorithm.")
+                    return None, None
 
                 # sanity checks we are not merging in a loop merge target
                 try:
                     merge_start = [node for node in merge_graph.nodes if merge_graph.in_degree(node) == 0][0]
                 except IndexError:
-                    raise Exception("Unable to merge a merge-graph with no head node")
+                    l.warning(f"This target did not have a merge head for the merge graph. This may be an error.")
+                    return None, None
 
                 merge_ends = [node for node in merge_graph.nodes if merge_graph.out_degree(node) == 0]
                 merge_blocks, og_blocks = bfs_list_blocks(merge_start, merge_graph), bfs_list_blocks(merge_base, removable_graph)
@@ -1204,14 +1268,14 @@ class DuplicationOptReverter(OptimizationPass):
         target_ends = self._find_merge_target_unique_ends(merge_targets)
         for merge_start, ends in target_ends.items():
             # if goto edge coming from start block (which is a conditional block)
-            if merge_start.statements[-1].tags['ins_addr'] in self.goto_locations:
+            if merge_start.statements[-1].ins_addr in self.goto_locations:
                 return True
 
             # if goto edge coming from end block (which can be conditional or non-conditional)
             for end in ends:
                 for stmt in end.statements:
                     # some instruction addrs can move... just check them all (lol)
-                    if stmt.tags['ins_addr'] in self.goto_locations:
+                    if stmt.ins_addr in self.goto_locations:
                         return True
 
         return False
@@ -1356,7 +1420,7 @@ class DuplicationOptReverter(OptimizationPass):
         cond_graph = nx.DiGraph()
 
         block_to_insn_map = {
-            node.addr: node.statements[-1].tags['ins_addr'] for node in temp_cond_graph.nodes()
+            node.addr: node.statements[-1].ins_addr for node in temp_cond_graph.nodes()
         }
         for merge_start in merge_start_nodes:
             for node in pre_graphs_maps[merge_start].nodes:
@@ -1426,7 +1490,10 @@ class DuplicationOptReverter(OptimizationPass):
             # TODO: find a better fix for this! Some duplicated nodes need destruction!
             # skip purposefully duplicated nodes
             #if any(isinstance(b.idx, int) and b.idx > 0 for b in [b0, b1]):
-            #    continue
+            #   continue
+
+            #if all([b.addr in [0x400207, 0x400211] for b in (b0, b1)]):
+            #    breakpoint()
 
             # blocks must share a region
             if not self._share_subregion([b0, b1]):

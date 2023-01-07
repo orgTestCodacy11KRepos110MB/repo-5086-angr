@@ -3,25 +3,19 @@ from typing import List, Optional
 import logging
 
 from ailment import Block, Const
-from ailment.expression import Convert, Load
-from ailment.statement import Statement, ConditionalJump, Jump, Assignment, Call, Store
+from ailment.expression import Convert
 import claripy
-from angr.knowledge_plugins.key_definitions.constants import OP_AFTER
+from angr.knowledge_plugins.key_definitions.constants import OP_BEFORE
 from .optimization_pass import OptimizationPass, OptimizationPassStage
 from ....knowledge_plugins.key_definitions.atoms import MemoryLocation
-from ..graph_region import GraphRegion
-from ..region_identifier import RegionIdentifier, MultiNode
-from ..utils import to_ail_supergraph
 from typing import Dict, Type, Callable
 
 import networkx as nx
 import itertools
-from ..ailblock_walker import AILBlockWalker, AILBlockWalkerBase
-from ..ailgraph_walker import RemoveNodeNotice
+from ..ailblock_walker import AILBlockWalkerBase
 from ailment.statement import Call, Statement, ConditionalJump, Assignment, Store, Return
 
 from ... import AnalysesHub
-from ..ailblock_walker import AILBlockWalker
 
 l = logging.getLogger(__name__)
 
@@ -149,7 +143,7 @@ class ConstPropOptReverter(OptimizationPass):
 
     def _analyze(self, cache=None):
         self.resolution = False
-        self.out_graph = to_ail_supergraph(self._graph)
+        self.out_graph = self._graph
 
         _pair_stmt_handlers = {
             Call: self._handle_Call_pair,
@@ -205,10 +199,10 @@ class ConstPropOptReverter(OptimizationPass):
 
             unwrapped_sym_arg = sym_arg.operands[0] if isinstance(sym_arg, Convert) else sym_arg
             try:
-                target_atom = MemoryLocation(unwrapped_sym_arg.addr.value, 4, 'Iend_LE')
+                target_atom = MemoryLocation(unwrapped_sym_arg.addr.value, const_arg.size, 'Iend_LE')
                 const_state = self.rd.get_reaching_definitions_by_node(
                     blks[calls[const_arg]].addr,
-                    OP_AFTER
+                    OP_BEFORE
                 )
 
                 state_load_vals = const_state.get_value_from_atom(target_atom)

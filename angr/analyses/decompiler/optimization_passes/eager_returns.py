@@ -151,9 +151,8 @@ class EagerReturnsSimplifier(OptimizationPass):
 
     def _block_has_goto_edge(self, block: ailment.Block):
         if block.addr in self.goto_locations or \
-                any(stmt.tags['ins_addr'] in self.goto_locations for stmt in block.statements):
+                any(stmt.ins_addr in self.goto_locations for stmt in block.statements):
             return True
-
 
     def _analyze_core(self, graph: networkx.DiGraph):
 
