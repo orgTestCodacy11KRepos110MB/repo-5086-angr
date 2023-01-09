@@ -7,7 +7,7 @@ import networkx
 
 import claripy
 from ailment.block import Block
-from ailment.statement import ConditionalJump, Jump, Label
+from ailment.statement import Statement, ConditionalJump, Jump, Label
 from ailment.expression import Const, UnaryOp
 
 from ....knowledge_plugins.cfg import IndirectJumpType
@@ -18,7 +18,7 @@ from ..condition_processor import ConditionProcessor
 from ..utils import remove_last_statement, extract_jump_targets, switch_extract_cmp_bounds, \
     is_empty_or_label_only_node, has_nonlabel_statements, first_nonlabel_statement
 from .structurer_nodes import ConditionNode, SequenceNode, LoopNode, ConditionalBreakNode, BreakNode, ContinueNode, \
-    BaseNode, MultiNode, SwitchCaseNode, IncompleteSwitchCaseNode, EmptyBlockNotice
+    BaseNode, MultiNode, SwitchCaseNode, IncompleteSwitchCaseNode, EmptyBlockNotice, MultiStatementExpressionNode
 from .structurer_base import StructurerBase
 
 if TYPE_CHECKING:
@@ -1300,7 +1300,7 @@ class PhoenixStructurer(StructurerBase):
 
             if full_graph.in_degree[left] > 1 and full_graph.in_degree[right] == 1:
                 left, right = right, left
-            if self._is_single_statement_block(left) \
+            if self._is_sequential_statement_block(left) \
                     and full_graph.in_degree[left] == 1 \
                     and full_graph.in_degree[right] >= 1:
                 edge_cond_left = self.cond_proc.recover_edge_condition(full_graph, start_node, left)
@@ -1339,7 +1339,7 @@ class PhoenixStructurer(StructurerBase):
 
             if full_graph.in_degree[left] == 1 and full_graph.in_degree[right] == 2:
                 left, right = right, left
-            if self._is_single_statement_block(right) \
+            if self._is_sequential_statement_block(right) \
                     and full_graph.in_degree[left] == 2 \
                     and full_graph.in_degree[right] == 1:
                 edge_cond_left = self.cond_proc.recover_edge_condition(full_graph, start_node, left)
@@ -1372,7 +1372,7 @@ class PhoenixStructurer(StructurerBase):
 
             if full_graph.in_degree[left] > 1 and full_graph.in_degree[successor] == 1:
                 left, successor = successor, left
-            if self._is_single_statement_block(left) \
+            if self._is_sequential_statement_block(left) \
                     and full_graph.in_degree[left] == 1 \
                     and full_graph.in_degree[successor] >= 1:
                 edge_cond_left = self.cond_proc.recover_edge_condition(full_graph, start_node, left)
@@ -1411,7 +1411,7 @@ class PhoenixStructurer(StructurerBase):
 
             if full_graph.in_degree[left] > 1 and full_graph.in_degree[else_node] == 1:
                 left, else_node = else_node, left
-            if self._is_single_statement_block(left) \
+            if self._is_sequential_statement_block(left) \
                     and full_graph.in_degree[left] == 1 \
                     and full_graph.in_degree[else_node] >= 1:
                 edge_cond_left = self.cond_proc.recover_edge_condition(full_graph, start_node, left)
@@ -1665,6 +1665,45 @@ class PhoenixStructurer(StructurerBase):
         if isinstance(node, (Block, MultiNode, SequenceNode)):
             return PhoenixStructurer._count_statements(node) == 1
         return False
+
+    @staticmethod
+    def _is_sequential_statement_block(node: Union[BaseNode,Block]) -> bool:
+        """
+        Examine if the node can be converted into a MultiStatementExpressionNode. The conversion fails if there are any
+        conditional statements or goto statements before the very last statement of the node.
+        """
+
+        def _is_sequential_statement_list(stmts: List[Statement]) -> bool:
+            if not stmts:
+                return True
+            for stmt in stmts[:-1]:
+                if isinstance(stmt, (ConditionalJump, Jump, MultiStatementExpressionNode, )):
+                    return False
+            if isinstance(stmts[-1], MultiStatementExpressionNode):
+                return False
+            return True
+
+        def _to_statement_list(node: Union[Block,MultiNode,SequenceNode]) -> List[Statement]:
+            if isinstance(node, Block):
+                return node.statements
+            if isinstance(node, MultiNode):
+                # expand it
+                all_statements = []
+                for nn in node.nodes:
+                    all_statements += _to_statement_list(nn)
+                return all_statements
+            if isinstance(node, SequenceNode):
+                all_statements = []
+                for nn in node.nodes:
+                    all_statements += _to_statement_list(nn)
+                return all_statements
+            raise TypeError(f"Unsupported node type {type(node)}")
+
+        try:
+            stmt_list = _to_statement_list(node)
+        except TypeError:
+            return False
+        return _is_sequential_statement_list(stmt_list)
 
     @staticmethod
     def _remove_edges_except(graph: networkx.DiGraph, src, dst):

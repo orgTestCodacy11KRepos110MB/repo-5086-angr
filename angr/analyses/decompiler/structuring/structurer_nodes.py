@@ -309,6 +309,17 @@ class SwitchCaseNode(BaseNode):
         self.addr = addr
 
 
+class MultiStatementExpressionNode(BaseNode):
+
+    __slots__ = ('blocks', )
+
+    def __init__(self, blocks):
+        self.blocks = blocks
+
+    def __repr__(self):
+        return f"<MultiStatementExpressionNode {self.addr:#x}>"
+
+
 class IncompleteSwitchCaseNode(BaseNode):
     """
     Describes an incomplete set of switch-case nodes. Usually an intermediate result. Should always be restructured
