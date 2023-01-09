@@ -26,7 +26,8 @@ from ....knowledge_plugins.gotos import Goto
 
 
 l = logging.getLogger(name=__name__)
-l.setLevel(1)
+_DEBUG = False
+l.setLevel(logging.DEBUG)
 
 
 #
@@ -792,12 +793,16 @@ class DuplicationOptReverter(OptimizationPass):
         """
         Entry analysis routine that will trigger the other analysis stages
         """
-        try:
+        if _DEBUG:
             self.deduplication_analysis(max_fix_attempts=30)
-        except StructuringError:
-            l.critical(f"Structuring failed! This function {self.target_name} is dead in the water!")
-        except Exception as e:
-            l.critical(f"Encountered an error while de-duplicating on {self.target_name}: {e}")
+        else:
+            try:
+                self.deduplication_analysis(max_fix_attempts=30)
+            except StructuringError:
+                l.critical(f"Structuring failed! This function {self.target_name} is dead in the water!")
+            except Exception as e:
+                l.critical(f"Encountered an error while de-duplicating on {self.target_name}: {e}")
+
         if self.out_graph:
             self.out_graph = add_labels(self.out_graph)
 
@@ -834,6 +839,7 @@ class DuplicationOptReverter(OptimizationPass):
         self.write_graph = add_labels(self.write_graph)
         self.ri = self.project.analyses[RegionIdentifier].prep(kb=self.kb)(
             self._func, graph=self.write_graph, cond_proc=self.ri.cond_proc, force_loop_single_exit=False,
+            complete_successors=True
         )
         rs = self.project.analyses[RecursiveStructurer].prep(kb=self.kb)(
             deepcopy(self.ri.region),

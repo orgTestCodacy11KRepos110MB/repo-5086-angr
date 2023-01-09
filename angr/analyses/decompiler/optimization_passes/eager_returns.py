@@ -132,6 +132,7 @@ class EagerReturnsSimplifier(OptimizationPass):
         # do structuring
         self.ri = self.project.analyses[RegionIdentifier].prep(kb=self.kb)(
             self._func, graph=self.graph_copy, cond_proc=self.ri.cond_proc, force_loop_single_exit=False,
+            complete_successors=True
         )
         rs = self.project.analyses[RecursiveStructurer].prep(kb=self.kb)(
             copy.deepcopy(self.ri.region),
