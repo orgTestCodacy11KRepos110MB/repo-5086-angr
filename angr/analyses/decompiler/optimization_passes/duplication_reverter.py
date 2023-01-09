@@ -26,7 +26,7 @@ from ....knowledge_plugins.gotos import Goto
 
 
 l = logging.getLogger(name=__name__)
-_DEBUG = False
+_DEBUG = True
 l.setLevel(logging.DEBUG)
 
 
