@@ -236,10 +236,12 @@ class EagerReturnsSimplifier(OptimizationPass):
             if not removed_edges:
                 continue
 
-            # remove all in-edges
+            # remove all in-edges that are now duplicated
             graph.remove_edges_from(removed_edges)
-            # remove the node to be copied
-            graph.remove_nodes_from(region)
+
+            # remove the node to be copied if all edges are now dead
+            if removed_edges == in_edges:
+                graph.remove_nodes_from(region)
             graph_changed = True
 
         return graph_changed
