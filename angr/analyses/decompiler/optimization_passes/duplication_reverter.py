@@ -808,7 +808,7 @@ class DuplicationOptReverter(OptimizationPass):
 
     def deduplication_analysis(self, max_fix_attempts=30, max_guarding_conditions=10):
         fix_round = 0
-        self.write_graph = remove_labels(to_ail_supergraph(self._graph))
+        self.write_graph = remove_labels(to_ail_supergraph(copy_graph_and_nodes(self._graph)))
         self.candidate_blacklist = set()
 
         updates = True
@@ -1498,7 +1498,7 @@ class DuplicationOptReverter(OptimizationPass):
             #if any(isinstance(b.idx, int) and b.idx > 0 for b in [b0, b1]):
             #   continue
 
-            #if all([b.addr in [0x400207, 0x400211] for b in (b0, b1)]):
+            #if all([b.addr in [0x400086, 0x400182] for b in (b0, b1)]):
             #    breakpoint()
 
             # blocks must share a region
@@ -1511,6 +1511,11 @@ class DuplicationOptReverter(OptimizationPass):
 
             # special case: when we only have a single stmt
             if len(b0.statements) == len(b1.statements) == 1:
+                # Case 1:
+                # [if(a)] == [if(b)]
+                #
+                # we must use the more expensive `similar` function to tell on the graph if they are
+                # stmts that result in the same successors
                 try:
                     is_similar = similar(b0, b1, graph=self.read_graph)
                 except Exception:
