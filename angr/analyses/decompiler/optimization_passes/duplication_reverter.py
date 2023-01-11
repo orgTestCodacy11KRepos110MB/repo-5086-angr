@@ -234,6 +234,24 @@ def bfs_list_blocks(start_block: Block, graph: nx.DiGraph):
     return blocks
 
 
+def copy_graph_and_nodes_same_idx(graph: nx.DiGraph):
+    """
+    TODO: the function below this that does the same need to be deprecated
+    """
+    new_graph = nx.DiGraph()
+    nodes_map = {}
+    for node in graph:
+        node_copy = node.copy()
+        node_copy.statements = [stmt for stmt in node_copy.statements]
+        nodes_map[node] = node_copy
+
+    new_graph.add_nodes_from(nodes_map.values())
+    for src, dst in graph.edges:
+        new_graph.add_edge(nodes_map[src], nodes_map[dst])
+
+    return new_graph
+
+
 def copy_graph_and_nodes(graph: nx.DiGraph) -> nx.DiGraph:
     new_graph = networkx.DiGraph()
     for node in graph.nodes:
@@ -413,8 +431,8 @@ def deepcopy_ail_anyjump(stmt: Union[Jump, ConditionalJump], idx=1):
                         "block ending in no jump. Place a jump there to fix it.")
 
 
-def correct_jump_targets(stmt, replacement_map: Dict[int, int], new_stmt=False):
-    if not replacement_map:
+def correct_jump_targets(stmt, replacement_map: Dict[int, int], new_stmt=True):
+    if not replacement_map or not isinstance(stmt, Statement):
         return stmt
 
     if isinstance(stmt, ConditionalJump):
@@ -808,8 +826,7 @@ class DuplicationOptReverter(OptimizationPass):
 
     def deduplication_analysis(self, max_fix_attempts=30, max_guarding_conditions=10):
         fix_round = 0
-        #self.write_graph = remove_labels(to_ail_supergraph(copy_graph_and_nodes(self._graph)))
-        self.write_graph = remove_labels(to_ail_supergraph(self._graph))
+        self.write_graph = remove_labels(to_ail_supergraph(copy_graph_and_nodes_same_idx(self._graph)))
         self.candidate_blacklist = set()
 
         updates = True
