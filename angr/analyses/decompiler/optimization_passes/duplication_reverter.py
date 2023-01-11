@@ -577,7 +577,21 @@ def ail_graph_similarity(block0: Block, block1: Block, graph: nx.DiGraph, only_b
         if b0 in discontinuity_blocks or b1 in discontinuity_blocks:
             continue
 
-        # SPECIAL CASE: b0 is b1 AND all its preds go to the same places
+        # SPECIAL CASE: 1
+        # ┌─┐         ┌─┐
+        # │A├─┐     ┌─┤A│
+        # └─┘ │     │ └─┘
+        #     ▼     ▼
+        #    ┌──┐ ┌──┐
+        #    │C'│ │C'│
+        #    └┬─┘ └┬─┘
+        #     │    │
+        #     ▼    ▼
+        #       ...
+        #
+        # Both similar blocks end in a block that is actually the same block. In this case, we don't
+        # want to count this since we will create a N blocks long similarity that continues from C' all
+        # the way to the end of the graph. This is only true if C' is not the end block of the graph.
         if b0 is b1:
             preds = list(graph.predecessors(b0))
             all_match = True
@@ -590,7 +604,9 @@ def ail_graph_similarity(block0: Block, block1: Block, graph: nx.DiGraph, only_b
                 if not all_match:
                     break
 
-            if all_match:
+            # CASE 1 confirmed, all edges in look the same. Now we check a special subset to see if the
+            # matching node has any edges out. If this node has no edges out, we are no longer ture for 1A
+            if all_match and len(list(graph.successors(b0))) != 0:
                 continue
 
         # find the common statements of the two
@@ -1278,28 +1294,44 @@ class DuplicationOptReverter(OptimizationPass):
                 removable_graph,
             )
 
-        if self._start_or_end_contains_goto(merge_targets):
+        if self._start_or_end_contains_goto(merge_targets, graph):
             merge_targets = self._update_target_successor_conditions(merge_targets)
             return merge_graph, merge_targets
         else:
             return None, None
 
-    def _start_or_end_contains_goto(self, merge_targets):
-        # only allow merge targets for those that end in goto
+    def _start_or_end_contains_goto(self, merge_targets, graph):
         # TODO: make this goto check better
         # what we should be doing is checking that two ends with the same successor are
         # connected with at least one goto
         target_ends = self._find_merge_target_unique_ends(merge_targets)
         for merge_start, ends in target_ends.items():
-            # if goto edge coming from start block (which is a conditional block)
+            # case1:
+            # A.last -> (goto) -> B.first
             if merge_start.statements[-1].ins_addr in self.goto_locations:
                 return True
 
-            # if goto edge coming from end block (which can be conditional or non-conditional)
+            # if case1 not satisfied, we need to do a harder look at the end of the merge graph
+            # for every possible end
             for end in ends:
+                # case2:
+                # A -> (goto) -> B.
+                # if goto edge coming from end block, from any instruction in the block
+                # since instructions can shift...
                 for stmt in end.statements:
                     # some instruction addrs can move... just check them all (lol)
                     if stmt.ins_addr in self.goto_locations:
+                        return True
+
+                # case3:
+                # A.last (conditional) -> (goto) -> B -> C
+                #
+                # Some condition ends in a goto to one of the ends of the merge graph. In this case,
+                # we consider it a modified version of case2
+                for pred in graph.predecessors(end):
+                    last_stmt = pred.statements[-1]
+                    if isinstance(last_stmt, ConditionalJump) and \
+                            (last_stmt.ins_addr in self.goto_locations or pred.addr in self.goto_locations):
                         return True
 
         return False
