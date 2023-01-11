@@ -808,7 +808,8 @@ class DuplicationOptReverter(OptimizationPass):
 
     def deduplication_analysis(self, max_fix_attempts=30, max_guarding_conditions=10):
         fix_round = 0
-        self.write_graph = remove_labels(to_ail_supergraph(copy_graph_and_nodes(self._graph)))
+        #self.write_graph = remove_labels(to_ail_supergraph(copy_graph_and_nodes(self._graph)))
+        self.write_graph = remove_labels(to_ail_supergraph(self._graph))
         self.candidate_blacklist = set()
 
         updates = True
