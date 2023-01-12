@@ -11,7 +11,7 @@ import networkx as nx
 import ailment
 from ailment.block import Block
 from ailment.statement import Statement, ConditionalJump, Jump, Assignment, Label
-from ailment.expression import Const, Register
+from ailment.expression import Const, Register, Convert
 import claripy
 
 from .optimization_pass import OptimizationPass, OptimizationPassStage
@@ -50,30 +50,6 @@ def remove_labels(graph: nx.DiGraph):
 
 
 def add_labels(graph: nx.DiGraph):
-    """
-    new_graph = copy_graph_and_nodes(graph)
-    for node in new_graph.nodes:
-        node: ailment.Block
-        lbl = ailment.Stmt.Label(None, f"LABEL_{node.addr:x}", node.addr, block_idx=node.idx)
-        node.statements.insert(0, lbl)
-
-    return new_graph
-    """
-    """
-    new_graph = networkx.DiGraph()
-    for node in graph.nodes:
-        lbl = ailment.Stmt.Label(None, f"LABEL_{node.addr:x}", node.addr, block_idx=node.idx)
-        new_graph.add_node(
-            ail_block_from_stmts([lbl] + node.statements, block_addr=node.addr)
-        )
-
-    for edge in graph.edges:
-        old_b0, old_b1 = edge
-        b0, b1 = find_block_by_addr(new_graph, old_b0.addr), find_block_by_addr(new_graph, old_b1.addr)
-        new_graph.add_edge(b0, b1)
-    
-    return new_graph
-    """
     new_graph = nx.DiGraph()
     nodes_map = {}
     for node in graph:
@@ -87,6 +63,23 @@ def add_labels(graph: nx.DiGraph):
         new_graph.add_edge(nodes_map[src], nodes_map[dst])
 
     return new_graph
+
+
+def remove_useless_gotos(graph: nx.DiGraph):
+    new_graph = nx.DiGraph()
+    nodes_map = {}
+    for node in graph:
+        node_copy = node.copy()
+        # remove Jumps from everything except the last node in the statements list
+        node_copy.statements = [stmt for stmt in node_copy.statements[:-1] if not isinstance(stmt, Jump)] + node_copy.statements[-1:]
+        nodes_map[node] = node_copy
+
+    new_graph.add_nodes_from(nodes_map.values())
+    for src, dst in graph.edges:
+        new_graph.add_edge(nodes_map[src], nodes_map[dst])
+
+    return new_graph
+
 
 def find_block_by_similarity(block, graph, node_list=None):
     nodes = node_list if node_list else list(graph.nodes())
@@ -729,7 +722,7 @@ def remove_redundant_jumps(graph: nx.DiGraph):
                 graph.add_edge(pred, successor)
 
             graph.remove_node(target_blk)
-            l.debug(f"REMOVING NODE IN SIMPLE_REDUNDANT: {target_blk}")
+            l.debug(f"removing node in simple redundant: {target_blk}")
             change |= True
             break
         else:
@@ -838,7 +831,7 @@ class DuplicationOptReverter(OptimizationPass):
                 l.critical(f"Encountered an error while de-duplicating on {self.target_name}: {e}")
 
         if self.out_graph:
-            self.out_graph = add_labels(self.out_graph)
+            self.out_graph = add_labels(remove_useless_gotos(self.out_graph))
 
     def deduplication_analysis(self, max_fix_attempts=30, max_guarding_conditions=10):
         fix_round = 0
@@ -1582,10 +1575,17 @@ class DuplicationOptReverter(OptimizationPass):
                 if isinstance(stmt0, Jump):
                     continue
 
-                # register-only assignments don't count, one must be a const or expression
-                if isinstance(stmt0, Assignment) and \
-                        (isinstance(stmt0.src, Register) and isinstance(stmt0.dst, Register)):
-                    continue
+                # Most Assignments don't count just by themselves:
+                # register = register
+                # TOP = const | register
+                if isinstance(stmt0, Assignment):
+                    src = stmt0.src.operand if isinstance(stmt0.dst, Convert) else stmt0.src
+                    if isinstance(src, Register) or (isinstance(src, Const) and src.bits > 2):
+                        continue
+                    """
+                    elif isinstance(src, Const) and self.project.loader.proj.find_object_containing(src.value) is None:
+                        continue
+                    """
 
                 for stmt1 in b1.statements:
                     # XXX: used to be just likes()
