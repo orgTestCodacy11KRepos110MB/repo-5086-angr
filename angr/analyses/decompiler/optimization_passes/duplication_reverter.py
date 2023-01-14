@@ -874,7 +874,7 @@ class DuplicationOptReverter(OptimizationPass):
     # Main Optimization Pass (after search)
     #
 
-    def _analyze(self, cache=None, stop_if_more_goto=True):
+    def _analyze(self, cache=None, stop_if_more_goto=False):
         """
         Entry analysis routine that will trigger the other analysis stages
         XXX: when in evaluation: stop_if_more_goto=True so that we never emit more gotos than we originally had
