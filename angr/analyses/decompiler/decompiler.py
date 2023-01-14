@@ -193,7 +193,6 @@ class Decompiler(Analysis):
             clinic.reaching_definitions,
             ite_exprs=ite_exprs,
         )
-        self.clinic.cc_graph = self.clinic._copy_graph()
         self._update_progress(75.0, text="Structuring code")
 
         # structure it
