@@ -315,6 +315,62 @@ def shared_common_conditional_dom(nodes, graph: nx.DiGraph):
 # AIL Helpers
 #
 
+def similar_conditional_when_single_corrected(block1: Block, block2: Block, graph: nx.DiGraph):
+    """
+    cond1, cond2 = block1.statements[-1], block2.statements[-1]
+    if not isinstance(cond1, ConditionalJump) or not isinstance(cond2, ConditionalJump):
+        return False
+    
+    # conditions must match 
+    if not cond1.likes(cond2):
+        return False
+
+    # colect the true and false targets for the condition
+    block_to_target_map = defaultdict(dict)
+    for (block, cond) in ((block1, cond1), (block2, cond2)):
+        for succ in graph.successors(block):
+            if succ.addr == cond.true_target.value:
+                block_to_target_map[block]["true_target"] = succ
+            elif succ.addr == cond.false_target.value:
+                block_to_target_map[block]["false_target"] = succ
+            else:
+                # exit early if you ever can't find a supposed target
+                return False
+
+    # check if at least one block in succesors match
+    one_match = False
+    mismatched_blocks = {}
+    for target_type in block_to_target_map[block1].keys():
+        t1_blk, t2_blk = block_to_target_map[block1][target_type], block_to_target_map[block2][target_type]
+        if similar(t1_blk, t2_blk, partial=True):
+            mismatched_blocks[block1]
+
+    if not one_match:
+        return False
+
+    # at this point at least one of the two blocks match
+
+    
+    single_mismatch = True
+    for attr in ["true_target", "false_target"]:
+        t1, t2 = getattr(cond1, attr).value, getattr(cond2, attr).value
+        # exit early if you can't actually find the succesors 
+        try:
+            t1_blk, t2_blk = find_block_by_addr(graph, t1), find_block_by_addr(graph, t2)
+        except Exception:
+            return False
+
+        # skip full checks when partial checking is on
+        if partial and t1_blk.statements[0].likes(t2_blk.statements[0]):
+            continue
+
+        if not similar(t1_blk, t2_blk, graph=graph):
+            return False
+    else:
+        return True
+    """
+    return True
+    
 
 def similar(ail_obj1, ail_obj2, graph: nx.DiGraph = None, partial=True):
     if type(ail_obj1) is not type(ail_obj2):
@@ -802,6 +858,8 @@ class DuplicationOptReverter(OptimizationPass):
         self.write_graph = None
         self.candidate_blacklist = None
 
+        self._starting_goto_count = None
+
         self.prev_graph = None
         self.func_name = self._func.name
         self.binary_name = self.project.loader.main_object.binary_basename
@@ -816,9 +874,10 @@ class DuplicationOptReverter(OptimizationPass):
     # Main Optimization Pass (after search)
     #
 
-    def _analyze(self, cache=None):
+    def _analyze(self, cache=None, stop_if_more_goto=True):
         """
         Entry analysis routine that will trigger the other analysis stages
+        XXX: when in evaluation: stop_if_more_goto=True so that we never emit more gotos than we originally had
         """
         if _DEBUG:
             self.deduplication_analysis(max_fix_attempts=30)
@@ -830,8 +889,14 @@ class DuplicationOptReverter(OptimizationPass):
             except Exception as e:
                 l.critical(f"Encountered an error while de-duplicating on {self.target_name}: {e}")
 
-        if self.out_graph:
-            self.out_graph = add_labels(remove_useless_gotos(self.out_graph))
+        if self.out_graph is not None:
+            if stop_if_more_goto:
+                # if structuring now has more gotos, don't save the graph
+                if self._starting_goto_count > len(self.goto_locations):
+                    self.out_graph = None
+            else:
+                # always save the graph (and add labels) if we have a graph
+                self.out_graph = add_labels(remove_useless_gotos(self.out_graph))
 
     def deduplication_analysis(self, max_fix_attempts=30, max_guarding_conditions=10):
         fix_round = 0
@@ -895,6 +960,9 @@ class DuplicationOptReverter(OptimizationPass):
 
         # collect gotos
         self.goto_locations = {goto.addr for goto in self.kb.gotos.locations[self._func.addr]}
+        if self._starting_goto_count is None:
+            self._starting_goto_count = len(self.goto_locations)
+
         if not self.goto_locations:
             return True
 
@@ -1541,7 +1609,7 @@ class DuplicationOptReverter(OptimizationPass):
             #if any(isinstance(b.idx, int) and b.idx > 0 for b in [b0, b1]):
             #   continue
 
-            #if all([b.addr in [0x400086, 0x400182] for b in (b0, b1)]):
+            #if all([b.addr in [0x404d45, 0x404c6b] for b in (b0, b1)]):
             #    breakpoint()
 
             # blocks must share a region
