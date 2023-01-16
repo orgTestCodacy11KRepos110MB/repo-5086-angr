@@ -15,7 +15,6 @@ from ....utils.graph import dominates, inverted_idoms, to_acyclic_graph
 from ...cfg.cfg_utils import CFGUtils
 from ..sequence_walker import SequenceWalker
 from ..condition_processor import ConditionProcessor
-from ..optimization_passes.lowered_switch_simplifier import LoweredSwitchSimplifier
 from ..utils import (
     remove_last_statement,
     extract_jump_targets,
@@ -820,6 +819,9 @@ class PhoenixStructurer(StructurerBase):
         if not r:
             # restore the graph to cascading if-then-elses
             l.warning("Cannot structure as a switch-case. Restore the sub graph to if-elses.")
+
+            # delay import
+            from ..optimization_passes.lowered_switch_simplifier import LoweredSwitchSimplifier
             LoweredSwitchSimplifier.restore_graph(node, last_stmt, graph, full_graph)
             raise GraphChangedNotification()
 
