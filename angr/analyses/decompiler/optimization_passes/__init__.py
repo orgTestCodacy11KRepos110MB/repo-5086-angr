@@ -31,12 +31,12 @@ _all_optimization_passes = [
     (ConstantDereferencesSimplifier, True),
     (RetAddrSaveSimplifier, True),
     (X86GccGetPcSimplifier, True),
-    (LoweredSwitchSimplifier, False),
     (ITEExprConverter, True),
     (ExprOpSwapper, True),
     (ConstPropOptReverter, True),
     (DuplicationOptReverter, True),
     (EagerReturnsSimplifier, True),
+    (LoweredSwitchSimplifier, True),
 ]
 
 

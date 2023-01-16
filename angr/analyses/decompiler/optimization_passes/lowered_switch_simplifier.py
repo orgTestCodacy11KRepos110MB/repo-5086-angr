@@ -1,3 +1,4 @@
+import copy
 from typing import Optional, Tuple, Union, TYPE_CHECKING
 import logging
 
@@ -6,9 +7,12 @@ import networkx
 from ailment import Block
 from ailment.statement import ConditionalJump
 from ailment.expression import BinaryOp, Const, Register, Load
+from .. import RegionIdentifier
+from ..condition_processor import ConditionProcessor
+from ..structuring import RecursiveStructurer, PhoenixStructurer
 
 from ...cfg.cfg_utils import CFGUtils
-from ..utils import first_nonlabel_statement, remove_last_statement
+from ..utils import first_nonlabel_statement, remove_last_statement, last_nonlabel_statement
 from ..structuring.structurer_nodes import IncompleteSwitchCaseHeadStatement, SequenceNode, MultiNode
 from .optimization_pass import OptimizationPass, OptimizationPassStage
 
@@ -59,7 +63,7 @@ class LoweredSwitchSimplifier(OptimizationPass):
         "AMD64",
     ]
     PLATFORMS = ["linux", "windows"]
-    STAGE = OptimizationPassStage.BEFORE_REGION_IDENTIFICATION
+    STAGE = OptimizationPassStage.DURING_REGION_IDENTIFICATION
     NAME = "Convert lowered switch-cases (if-else) to switch-cases"
     DESCRIPTION = (
         "Convert lowered switch-cases (if-else) to switch-cases. Only works when the Phoenix structuring "
@@ -79,12 +83,20 @@ class LoweredSwitchSimplifier(OptimizationPass):
         return True, None
 
     def _analyze(self, cache=None):
+        # graph must have some valid gotos
+        graph_copy = networkx.DiGraph(self._graph)
+        if not self._graph_contains_valid_gotos(graph_copy):
+            return
 
-        variable_to_cases = self._find_cascading_switch_variable_comparisons()
+        try:
+            variable_to_cases = self._find_cascading_switch_variable_comparisons()
+        except AssertionError:
+            return
 
         if not variable_to_cases:
             return
 
+        # reset the copy
         graph_copy = networkx.DiGraph(self._graph)
         self.out_graph = graph_copy
 
@@ -340,3 +352,43 @@ class LoweredSwitchSimplifier(OptimizationPass):
 
         # all good - remove the last statement in node
         remove_last_statement(node)
+    #
+    # taken from deduplicator
+    #
+
+    def _graph_contains_valid_gotos(self, graph):
+        # reset gotos
+        self.kb.gotos.locations[self._func.addr] = set()
+
+        # do structuring
+        self.ri = self.project.analyses[RegionIdentifier].prep(kb=self.kb)(
+            self._func, graph=graph, cond_proc=ConditionProcessor(self.project.arch), force_loop_single_exit=False,
+            complete_successors=True
+        )
+        rs = self.project.analyses[RecursiveStructurer].prep(kb=self.kb)(
+            copy.deepcopy(self.ri.region),
+            cond_proc=self.ri.cond_proc,
+            func=self._func,
+            structurer_cls=PhoenixStructurer
+        )
+        if not rs.result.nodes:
+            _l.critical(f"Failed to redo structuring...")
+            return False
+
+        self.project.analyses.RegionSimplifier(self._func, rs.result, kb=self.kb, variable_kb=self._variable_kb)
+
+        # collect gotos
+        return self._has_conditional_jump_with_goto(graph)
+
+    def _has_conditional_jump_with_goto(self, graph):
+        goto_locations = {goto.addr for goto in self.kb.gotos.locations[self._func.addr]}
+        """
+        for block in graph.nodes:
+            last_stmt = last_nonlabel_statement(block)
+            if isinstance(last_stmt, ConditionalJump) and \
+                    (last_stmt.ins_addr in goto_locations or block.addr in goto_locations):
+                return True
+
+        return False
+        """
+        return len(goto_locations) != 0

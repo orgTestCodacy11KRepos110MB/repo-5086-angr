@@ -1378,6 +1378,28 @@ class DuplicationOptReverter(OptimizationPass):
 
         return True
 
+    def _block_has_goto_edge(self, block: ailment.Block, graph=None):
+        # case1:
+        # A -> (goto) -> B.
+        # if goto edge coming from end block, from any instruction in the block
+        # since instructions can shift...
+        if block.addr in self.goto_locations or \
+                any(stmt.ins_addr in self.goto_locations for stmt in block.statements):
+            return True
+        # case2:
+        # A.last (conditional) -> (goto) -> B -> C
+        #
+        # Some condition ends in a goto to one of the ends of the merge graph. In this case,
+        # we consider it a modified version of case2
+        elif graph:
+            for pred in graph.predecessors(block):
+                last_stmt = pred.statements[-1]
+                if isinstance(last_stmt, ConditionalJump) and \
+                        (last_stmt.ins_addr in self.goto_locations or pred.addr in self.goto_locations):
+                    return True
+
+        return False
+
     def _start_or_end_contains_goto(self, merge_targets, graph):
         # TODO: make this goto check better
         # what we should be doing is checking that two ends with the same successor are
@@ -1392,25 +1414,8 @@ class DuplicationOptReverter(OptimizationPass):
             # if case1 not satisfied, we need to do a harder look at the end of the merge graph
             # for every possible end
             for end in ends:
-                # case2:
-                # A -> (goto) -> B.
-                # if goto edge coming from end block, from any instruction in the block
-                # since instructions can shift...
-                for stmt in end.statements:
-                    # some instruction addrs can move... just check them all (lol)
-                    if stmt.ins_addr in self.goto_locations:
-                        return True
-
-                # case3:
-                # A.last (conditional) -> (goto) -> B -> C
-                #
-                # Some condition ends in a goto to one of the ends of the merge graph. In this case,
-                # we consider it a modified version of case2
-                for pred in graph.predecessors(end):
-                    last_stmt = pred.statements[-1]
-                    if isinstance(last_stmt, ConditionalJump) and \
-                            (last_stmt.ins_addr in self.goto_locations or pred.addr in self.goto_locations):
-                        return True
+                if self._block_has_goto_edge(end, graph=graph):
+                    return True
 
         return False
 

@@ -323,6 +323,13 @@ def first_nonlabel_statement(block: ailment.Block) -> Optional[ailment.Stmt.Stat
     return None
 
 
+def last_nonlabel_statement(block: ailment.Block) -> Optional[ailment.Stmt.Statement]:
+    for stmt in block.statements[::-1]:
+        if not isinstance(stmt, ailment.Stmt.Label):
+            return stmt
+    return None
+
+
 def first_nonlabel_node(seq: "SequenceNode") -> Optional[Union["BaseNode", ailment.Block]]:
     for node in seq.nodes:
         if isinstance(node, CodeNode):

@@ -7,7 +7,7 @@ import inspect
 import networkx
 
 import ailment
-from ailment.statement import Jump
+from ailment.statement import Jump, ConditionalJump
 from ailment.expression import Const
 from .. import RegionIdentifier
 
@@ -150,10 +150,27 @@ class EagerReturnsSimplifier(OptimizationPass):
         self.goto_locations = {goto.addr for goto in self.kb.gotos.locations[self._func.addr]}
         return True, len(self.goto_locations) != 0
 
-    def _block_has_goto_edge(self, block: ailment.Block):
+    def _block_has_goto_edge(self, block: ailment.Block, graph=None):
+        # case1:
+        # A -> (goto) -> B.
+        # if goto edge coming from end block, from any instruction in the block
+        # since instructions can shift...
         if block.addr in self.goto_locations or \
                 any(stmt.ins_addr in self.goto_locations for stmt in block.statements):
             return True
+        # case2:
+        # A.last (conditional) -> (goto) -> B -> C
+        #
+        # Some condition ends in a goto to one of the ends of the merge graph. In this case,
+        # we consider it a modified version of case2
+        elif graph:
+            for pred in graph.predecessors(block):
+                last_stmt = pred.statements[-1]
+                if isinstance(last_stmt, ConditionalJump) and \
+                        (last_stmt.ins_addr in self.goto_locations or pred.addr in self.goto_locations):
+                    return True
+
+        return False
 
     def _analyze_core(self, graph: networkx.DiGraph):
 
@@ -203,7 +220,7 @@ class EagerReturnsSimplifier(OptimizationPass):
             removed_edges = list()
             for in_edge in in_edges:
                 pred_node = in_edge[0]
-                if not self._block_has_goto_edge(pred_node):
+                if not self._block_has_goto_edge(pred_node, graph=graph):
                     continue
 
                 removed_edges.append(in_edge)
