@@ -26,7 +26,7 @@ from ....knowledge_plugins.gotos import Goto
 
 
 l = logging.getLogger(name=__name__)
-_DEBUG = False
+_DEBUG = True
 l.setLevel(logging.DEBUG)
 
 
@@ -315,62 +315,6 @@ def shared_common_conditional_dom(nodes, graph: nx.DiGraph):
 # AIL Helpers
 #
 
-def similar_conditional_when_single_corrected(block1: Block, block2: Block, graph: nx.DiGraph):
-    """
-    cond1, cond2 = block1.statements[-1], block2.statements[-1]
-    if not isinstance(cond1, ConditionalJump) or not isinstance(cond2, ConditionalJump):
-        return False
-    
-    # conditions must match 
-    if not cond1.likes(cond2):
-        return False
-
-    # colect the true and false targets for the condition
-    block_to_target_map = defaultdict(dict)
-    for (block, cond) in ((block1, cond1), (block2, cond2)):
-        for succ in graph.successors(block):
-            if succ.addr == cond.true_target.value:
-                block_to_target_map[block]["true_target"] = succ
-            elif succ.addr == cond.false_target.value:
-                block_to_target_map[block]["false_target"] = succ
-            else:
-                # exit early if you ever can't find a supposed target
-                return False
-
-    # check if at least one block in succesors match
-    one_match = False
-    mismatched_blocks = {}
-    for target_type in block_to_target_map[block1].keys():
-        t1_blk, t2_blk = block_to_target_map[block1][target_type], block_to_target_map[block2][target_type]
-        if similar(t1_blk, t2_blk, partial=True):
-            mismatched_blocks[block1]
-
-    if not one_match:
-        return False
-
-    # at this point at least one of the two blocks match
-
-    
-    single_mismatch = True
-    for attr in ["true_target", "false_target"]:
-        t1, t2 = getattr(cond1, attr).value, getattr(cond2, attr).value
-        # exit early if you can't actually find the succesors 
-        try:
-            t1_blk, t2_blk = find_block_by_addr(graph, t1), find_block_by_addr(graph, t2)
-        except Exception:
-            return False
-
-        # skip full checks when partial checking is on
-        if partial and t1_blk.statements[0].likes(t2_blk.statements[0]):
-            continue
-
-        if not similar(t1_blk, t2_blk, graph=graph):
-            return False
-    else:
-        return True
-    """
-    return True
-    
 
 def similar(ail_obj1, ail_obj2, graph: nx.DiGraph = None, partial=True):
     if type(ail_obj1) is not type(ail_obj2):
@@ -395,6 +339,10 @@ def similar(ail_obj1, ail_obj2, graph: nx.DiGraph = None, partial=True):
             liked = ail_obj1.likes(ail_obj2)
             if liked or not graph:
                 return liked
+
+            # even in partial matching, the condition must at least match
+            if not ail_obj1.condition.likes(ail_obj2.condition):
+                return False
 
             # must use graph to know
             for attr in ["true_target", "false_target"]:
@@ -859,6 +807,7 @@ class DuplicationOptReverter(OptimizationPass):
         self.candidate_blacklist = None
 
         self._starting_goto_count = None
+        self._unique_fake_addr = 0
 
         self.prev_graph = None
         self.func_name = self._func.name
@@ -968,12 +917,11 @@ class DuplicationOptReverter(OptimizationPass):
 
         # optimize the graph?
         self.write_graph = self.simple_optimize_graph(self.write_graph)
-        self.read_graph = self.write_graph.copy()
         return False
 
     def _post_deduplication_round(self):
         self.prev_graph = self.out_graph.copy() if self.out_graph is not None else self._graph
-        self.out_graph = self.write_graph
+        self.out_graph = self.simple_optimize_graph(self.write_graph)
         self.candidate_blacklist = set()
 
     def _deduplication_round(self, max_guarding_conditions=10):
@@ -982,6 +930,7 @@ class DuplicationOptReverter(OptimizationPass):
         #
 
         candidates = self._find_initial_candidates()
+        self.read_graph = self.write_graph.copy()
         if not candidates:
             l.info("There are no duplicate statements in this function, stopping analysis")
             return False, False
@@ -1361,6 +1310,74 @@ class DuplicationOptReverter(OptimizationPass):
         else:
             return None, None
 
+    def similar_conditional_when_single_corrected(self, block1: Block, block2: Block, graph: nx.DiGraph):
+        cond1, cond2 = block1.statements[-1], block2.statements[-1]
+        if not isinstance(cond1, ConditionalJump) or not isinstance(cond2, ConditionalJump):
+            return False
+
+        # conditions must match
+        if not cond1.condition.likes(cond2.condition):
+            return False
+
+        # colect the true and false targets for the condition
+        block_to_target_map = defaultdict(dict)
+        for (block, cond) in ((block1, cond1), (block2, cond2)):
+            for succ in graph.successors(block):
+                if succ.addr == cond.true_target.value:
+                    block_to_target_map[block]["true_target"] = succ
+                elif succ.addr == cond.false_target.value:
+                    block_to_target_map[block]["false_target"] = succ
+                else:
+                    # exit early if you ever can't find a supposed target
+                    return False
+
+        # check if at least one block in succesors match
+        mismatched_blocks = {}
+        for target_type in block_to_target_map[block1].keys():
+            t1_blk, t2_blk = block_to_target_map[block1][target_type], block_to_target_map[block2][target_type]
+            if not similar(t1_blk, t2_blk, partial=True):
+                mismatched_blocks[target_type] = {block1: t1_blk, block2: t2_blk}
+
+        if len(mismatched_blocks) != 1:
+            return False
+
+        # We now know that at least one block matches
+        # at this moment we have something that looks like this:
+        #   A ---> C <--- B
+        #   |             |
+        #   V             V
+        #   D             E
+        #
+        # A and B both share the same condition, point to a block that is either similar to each
+        # other or the same block, AND they have a mistmatch block D & E. We want to make a new NOP
+        # block that is between A->D and B->E to make a balanced merged graph:
+        #
+        #   A ---> C <--- B
+        #   |             |
+        #   V             V
+        #   N -> D   E <- N'
+        #
+        # We now will have a balanced merge graph
+        for target_type, block_map in mismatched_blocks.items():
+            for src, dst in block_map.items():
+                # create a new nop block
+                nop_blk = Block(
+                    self._unique_fake_addr, 0, statements=[
+                        Jump(0, Const(0, 0, 0, self.project.arch.bits), 0, ins_addr=self._unique_fake_addr)
+                    ]
+                )
+                self._unique_fake_addr += 1
+                # point src -> nop -> dst
+                graph.add_edge(src, nop_blk)
+                graph.add_edge(nop_blk, dst)
+                # unlink src -X-> dst
+                graph.remove_edge(src, dst)
+                # correct the targets of the src
+                target = getattr(src.statements[-1], target_type)
+                setattr(target, "value", nop_blk.addr)
+
+        return True
+
     def _start_or_end_contains_goto(self, merge_targets, graph):
         # TODO: make this goto check better
         # what we should be doing is checking that two ends with the same successor are
@@ -1603,7 +1620,7 @@ class DuplicationOptReverter(OptimizationPass):
 
     def _find_initial_candidates(self) -> List[Tuple[Block, Block]]:
         initial_candidates = list()
-        for b0, b1 in combinations(self.read_graph.nodes, 2):
+        for b0, b1 in combinations(self.write_graph.nodes, 2):
             # TODO: find a better fix for this! Some duplicated nodes need destruction!
             # skip purposefully duplicated nodes
             #if any(isinstance(b.idx, int) and b.idx > 0 for b in [b0, b1]):
@@ -1617,7 +1634,7 @@ class DuplicationOptReverter(OptimizationPass):
                 continue
 
             # must share a common dominator
-            if not shared_common_conditional_dom([b0, b1], self.read_graph):
+            if not shared_common_conditional_dom([b0, b1], self.write_graph):
                 continue
 
             # special case: when we only have a single stmt
@@ -1628,9 +1645,17 @@ class DuplicationOptReverter(OptimizationPass):
                 # we must use the more expensive `similar` function to tell on the graph if they are
                 # stmts that result in the same successors
                 try:
-                    is_similar = similar(b0, b1, graph=self.read_graph)
+                    is_similar = similar(b0, b1, graph=self.write_graph)
                 except Exception:
                     continue
+
+                # Case 2:
+                # [if(a)] == [if(a)]
+                # and at least one child for the correct target type matches
+                if not is_similar:
+                    # TODO: fix this and add it back
+                    #is_similar = self.similar_conditional_when_single_corrected(b0, b1, self.write_graph)
+                    pass
 
                 if is_similar:
                     initial_candidates.append((b0, b1))
@@ -1657,14 +1682,14 @@ class DuplicationOptReverter(OptimizationPass):
 
                 for stmt1 in b1.statements:
                     # XXX: used to be just likes()
-                    if similar(stmt0, stmt1, self.read_graph):
+                    if similar(stmt0, stmt1, self.write_graph):
                         stmt_in_common = True
                         break
 
                 if stmt_in_common:
                     pair = (b0, b1)
                     # only append pairs that share a dominator
-                    if shared_common_conditional_dom(pair, self.read_graph) is not None:
+                    if shared_common_conditional_dom(pair, self.write_graph) is not None:
                         initial_candidates.append(pair)
 
                     break
