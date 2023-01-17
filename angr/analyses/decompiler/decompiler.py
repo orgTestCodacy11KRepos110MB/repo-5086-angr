@@ -193,8 +193,8 @@ class Decompiler(Analysis):
             clinic.reaching_definitions,
             ite_exprs=ite_exprs,
         )
-        from .optimization_passes.duplication_reverter import remove_labels
-        clinic.cc_graph = remove_labels(clinic.copy_graph())
+        #from .optimization_passes.duplication_reverter import remove_labels
+        #clinic.cc_graph = remove_labels(clinic.copy_graph())
         self._update_progress(75.0, text="Structuring code")
 
         # structure it
