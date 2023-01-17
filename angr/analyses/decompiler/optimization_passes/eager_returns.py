@@ -9,6 +9,7 @@ import networkx
 import ailment
 from ailment.statement import Jump, ConditionalJump
 from ailment.expression import Const
+from angr.knowledge_plugins.gotos import Goto
 from .. import RegionIdentifier
 
 from ..condition_processor import ConditionProcessor, EmptyBlockNotice
@@ -147,7 +148,7 @@ class EagerReturnsSimplifier(OptimizationPass):
         self.project.analyses.RegionSimplifier(self._func, rs.result, kb=self.kb, variable_kb=self._variable_kb)
 
         # collect gotos
-        self.goto_locations = {goto.addr for goto in self.kb.gotos.locations[self._func.addr]}
+        self.goto_locations = {goto.addr: goto for goto in self.kb.gotos.locations[self._func.addr]}
         return True, len(self.goto_locations) != 0
 
     def _block_has_goto_edge(self, block: ailment.Block, graph=None):
@@ -166,9 +167,10 @@ class EagerReturnsSimplifier(OptimizationPass):
         elif graph:
             for pred in graph.predecessors(block):
                 last_stmt = pred.statements[-1]
-                if isinstance(last_stmt, ConditionalJump) and \
-                        (last_stmt.ins_addr in self.goto_locations or pred.addr in self.goto_locations):
-                    return True
+                if isinstance(last_stmt, ConditionalJump) and last_stmt.ins_addr in self.goto_locations:
+                    goto: Goto = self.goto_locations[last_stmt.ins_addr]
+                    if goto.target_addr in (block.addr, block.statements[0].ins_addr):
+                        return True
 
         return False
 

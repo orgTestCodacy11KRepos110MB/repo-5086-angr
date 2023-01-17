@@ -908,7 +908,7 @@ class DuplicationOptReverter(OptimizationPass):
             raise StructuringError
 
         # collect gotos
-        self.goto_locations = {goto.addr for goto in self.kb.gotos.locations[self._func.addr]}
+        self.goto_locations = {goto.addr: goto for goto in self.kb.gotos.locations[self._func.addr]}
         if self._starting_goto_count is None:
             self._starting_goto_count = len(self.goto_locations)
 
@@ -1394,9 +1394,14 @@ class DuplicationOptReverter(OptimizationPass):
         elif graph:
             for pred in graph.predecessors(block):
                 last_stmt = pred.statements[-1]
-                if isinstance(last_stmt, ConditionalJump) and \
-                        (last_stmt.ins_addr in self.goto_locations or pred.addr in self.goto_locations):
-                    return True
+                if isinstance(last_stmt, ConditionalJump) and last_stmt.ins_addr in self.goto_locations:
+                    # XXX: this is only valid for duplication reverter
+                    if block.idx is not None:
+                        return True
+
+                    goto: Goto = self.goto_locations[last_stmt.ins_addr]
+                    if goto.target_addr in (block.addr, block.statements[0].ins_addr):
+                        return True
 
         return False
 
