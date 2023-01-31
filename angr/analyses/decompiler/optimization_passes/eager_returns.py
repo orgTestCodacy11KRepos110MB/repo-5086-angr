@@ -220,11 +220,19 @@ class EagerReturnsSimplifier(OptimizationPass):
         for region_head, (in_edges, region) in to_update.items():
             # update the graph
             removed_edges = list()
+            has_goto_edge = True
             for in_edge in in_edges:
                 pred_node = in_edge[0]
-                if not self._block_has_goto_edge(pred_node, graph=graph):
-                    continue
+                if self._block_has_goto_edge(pred_node, graph=graph):
+                    break
+            else:
+                has_goto_edge = False
 
+            if not has_goto_edge:
+                continue
+
+            for in_edge in in_edges:
+                pred_node = in_edge[0]
                 removed_edges.append(in_edge)
 
                 # Modify the graph and then add an edge to the copy of the region

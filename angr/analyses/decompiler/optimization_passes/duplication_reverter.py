@@ -94,6 +94,14 @@ def find_block_by_similarity(block, graph, node_list=None):
     return similar_blocks[0]
 
 
+def find_block_in_successors_by_addr(addr: int, block: ailment.Block, graph: nx.DiGraph):
+    for succ in graph.successors(block):
+        if succ.addr == addr or succ.statements[0].ins_addr == addr:
+            return succ
+    else:
+        return None
+
+
 def find_block_by_addr(graph: networkx.DiGraph, addr, insn_addr=False):
     if insn_addr:
         def _get_addr(b): return b.statements[0].ins_addr
@@ -786,6 +794,7 @@ class SAILRError(Exception):
 # Main Analysis
 #
 
+
 class DuplicationOptReverter(OptimizationPass):
     """
     Reverts the duplication of statements
@@ -1378,20 +1387,34 @@ class DuplicationOptReverter(OptimizationPass):
 
         return True
 
-    def _block_has_goto_edge(self, block: ailment.Block, graph=None):
+    def _block_has_goto_edge(self, block: ailment.Block, other_ends, graph=None):
+        #if block.addr in [0x40093c, 0x4007be]:
+        #    breakpoint()
+        
         # case1:
         # A -> (goto) -> B.
         # if goto edge coming from end block, from any instruction in the block
         # since instructions can shift...
-        if block.addr in self.goto_locations or \
-                any(stmt.ins_addr in self.goto_locations for stmt in block.statements):
-            return True
+        has_goto_edge = False
+        target_block = None
+        if block.addr in self.goto_locations:
+            goto = self.goto_locations[block.addr]
+            has_goto_edge = True
+            target_block = find_block_in_successors_by_addr(goto.target_addr, block, graph)
+
+        for stmt in block.statements:
+            if stmt.ins_addr in self.goto_locations:
+                goto = self.goto_locations[stmt.ins_addr]
+                has_goto_edge = True
+                target_block = find_block_in_successors_by_addr(goto.target_addr, block, graph)
+                break
+
         # case2:
         # A.last (conditional) -> (goto) -> B -> C
         #
         # Some condition ends in a goto to one of the ends of the merge graph. In this case,
         # we consider it a modified version of case2
-        elif graph:
+        if graph and (not has_goto_edge or target_block is None):
             for pred in graph.predecessors(block):
                 last_stmt = pred.statements[-1]
                 if isinstance(last_stmt, ConditionalJump) and last_stmt.ins_addr in self.goto_locations:
@@ -1401,15 +1424,24 @@ class DuplicationOptReverter(OptimizationPass):
 
                     goto: Goto = self.goto_locations[last_stmt.ins_addr]
                     if goto.target_addr in (block.addr, block.statements[0].ins_addr):
-                        return True
+                        has_goto_edge = True
+                        target_block = block
 
-        return False
+        if not has_goto_edge or target_block is None:
+            return False
+
+        for block in other_ends:
+            if not nx.has_path(graph, block, target_block):
+                return False
+        else:
+            return True
 
     def _start_or_end_contains_goto(self, merge_targets, graph):
         # TODO: make this goto check better
         # what we should be doing is checking that two ends with the same successor are
         # connected with at least one goto
         target_ends = self._find_merge_target_unique_ends(merge_targets)
+        all_ends = list(itertools.chain.from_iterable(list(target_ends.values())))
         for merge_start, ends in target_ends.items():
             # case1:
             # A.last -> (goto) -> B.first
@@ -1419,7 +1451,7 @@ class DuplicationOptReverter(OptimizationPass):
             # if case1 not satisfied, we need to do a harder look at the end of the merge graph
             # for every possible end
             for end in ends:
-                if self._block_has_goto_edge(end, graph=graph):
+                if self._block_has_goto_edge(end, [e for e in all_ends if e is not end], graph=graph):
                     return True
 
         return False
